@@ -39,14 +39,17 @@
 //
 // External control (no HTTP admin endpoint): a second process (see cmd/
 // s3-admin) opens the same SQLite file and writes INTO control tables. The
-// tier polls them on a fixed 1s cadence and consumes:
+// tier consumes them on two occasions only — at startup, and when the
+// sentinel file (statePath + ".ctl") is touched AFTER the write. There is
+// NO periodic polling of the control tables (an early design polled the
+// DB every second; the sentinel design makes the steady-state cost zero).
 //
 //   - control(k,v): runtime overrides of auto_enabled / cold_after_ms /
 //     max_hot_bytes / promote_on_access — the memory maps are authoritative
 //     for object data, so external edits MUST go through these tables or
 //     they get silently overwritten by the next upsert.
 //   - commands(seq,verb,arg): force operations (migrate / promote by key or
-//     content id) executed by the polling loop.
+//     content id) executed on ingest.
 //
 // Read-side queries (status, idle detection) can be done directly with any
 // SQLite client against the resources/objects tables — they are a live
@@ -75,6 +78,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	_ "modernc.org/sqlite" // pure-Go SQLite, no cgo
 
 	"s3proxy/internal/store"
@@ -148,12 +152,13 @@ type TieredStore struct {
 	cfg   Config
 	now   func() time.Time
 
-	statePath string
-	db        *sql.DB
-	mu        sync.Mutex
-	idx       map[string]*objRow // "bucket/key" -> name row
-	res       map[string]*resRow // content id -> resource row
-	buckets   map[string]time.Time
+	statePath    string
+	sentinelPath string // statePath + ".ctl": touch = external control input
+	db           *sql.DB
+	mu           sync.Mutex
+	idx          map[string]*objRow // "bucket/key" -> name row
+	res          map[string]*resRow // content id -> resource row
+	buckets      map[string]time.Time
 
 	upObj     *sql.Stmt
 	delObj    *sql.Stmt
@@ -260,6 +265,15 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		buckets:   make(map[string]time.Time),
 	}
 	t.autoOn.Store(true) // auto migration starts enabled; control can pause
+	// Ensure the sentinel exists so the watcher can attach to it; existing
+	// file is left untouched (its mtime is the "admin wrote rows" signal).
+	sentinel := statePath + ".ctl"
+	if f, err := os.OpenFile(sentinel, os.O_CREATE, 0o644); err == nil {
+		f.Close()
+		t.sentinelPath = sentinel
+	} else {
+		return nil, fmt.Errorf("tier: create sentinel %s: %w", sentinel, err)
+	}
 	for _, p := range pools {
 		t.pools[p.Name()] = p
 	}
@@ -1269,27 +1283,93 @@ func (t *TieredStore) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// pollControl runs the external-control consumer on a fixed cadence: read
-// the control table (policy overrides + pause flag) and drain the commands
-// queue. The 1s cadence is what makes "write the DB from another process"
-// work as remote control; a single tiny SELECT per second on the
-// single-connection DB is negligible.
+// pollControl consumes external control input. Two triggers, no polling:
+// filesystem events on the sentinel file (the admin process touches it
+// after writing control/commands rows), and a slow stat fallback for lost
+// events. The fallback is a stat(2) on the sentinel path — it never reads
+// the DB, so a broken producer cannot cause hot-path DB traffic.
 func (t *TieredStore) pollControl(ctx context.Context) {
-	ticker := time.NewTicker(controlPollInterval)
+	// Consume once on start: rows written before this process came up
+	// (a paused maintenance window must survive a restart).
+	t.consumeControl(ctx)
+	t.consumeCommands(ctx)
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("tier: sentinel watch unavailable, stat fallback only: %v", err)
+		t.statFallback(ctx)
+		return
+	}
+	defer watcher.Close()
+	watcher.Add(t.sentinelPath)
+
+	lastStat := int64(0)
+	fallback := time.NewTicker(controlFallbackInterval)
+	defer fallback.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// Any event on the sentinel (create/write/chmod) means: an
+			// admin wrote rows. Consume; repeated events just re-consume
+			// (commands rows are deleted after execution, so this is
+			// idempotent and cheap: zero rows = zero work).
+			if ev.Name == t.sentinelPath {
+				t.consumeControl(ctx)
+				t.consumeCommands(ctx)
+				lastStat = t.sentinelMtime()
+			}
+		case _, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("tier: sentinel watch: %v", err)
+		case <-fallback.C:
+			// stat-only safety net; catches touches the watcher missed.
+			if m := t.sentinelMtime(); m != 0 && m != lastStat {
+				t.consumeControl(ctx)
+				t.consumeCommands(ctx)
+				lastStat = m
+			}
+		}
+	}
+}
+
+func (t *TieredStore) statFallback(ctx context.Context) {
+	lastStat := int64(0)
+	ticker := time.NewTicker(controlFallbackInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			t.consumeControl(ctx)
-			t.consumeCommands(ctx)
+			if m := t.sentinelMtime(); m != 0 && m != lastStat {
+				t.consumeControl(ctx)
+				t.consumeCommands(ctx)
+				lastStat = m
+			}
 		}
 	}
 }
 
-// controlPollInterval is the latency budget for external admin actions.
-const controlPollInterval = time.Second
+// sentinelMtime returns the sentinel file mtime in nanoseconds (0 when
+// absent); a change is the "admin wrote rows" signal.
+func (t *TieredStore) sentinelMtime() int64 {
+	st, err := os.Stat(t.sentinelPath)
+	if err != nil {
+		return 0
+	}
+	return st.ModTime().UnixNano()
+}
+
+// controlFallbackInterval backs up the fs event path; stat-only, never a DB
+// read.
+const controlFallbackInterval = time.Minute
 
 // consumeControl applies the control table to the running policy. The
 // full table is re-read and a fresh overrides struct is published on every

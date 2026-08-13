@@ -66,6 +66,7 @@ func main() {
 			v = "1"
 		}
 		setControl(db, "auto_enabled", v)
+		touchSentinel(dbPath)
 		fmt.Printf("auto migration %s\n", map[string]string{"0": "paused", "1": "resumed"}[v])
 	case "set":
 		fs := flag.NewFlagSet("set", flag.ExitOnError)
@@ -99,6 +100,7 @@ func main() {
 		if *coldAfter == "" && *maxHot == "" && *promote == "" {
 			fatal(fmt.Errorf("set needs at least one of --cold-after/--max-hot-bytes/--promote"))
 		}
+		touchSentinel(dbPath)
 	case "migrate", "promote":
 		if len(rest) != 1 {
 			fatal(fmt.Errorf("%s needs exactly one target: <bucket/key> or <content-id>", cmd))
@@ -106,7 +108,8 @@ func main() {
 		if _, err := db.Exec(`INSERT INTO commands (verb, arg) VALUES (?, ?)`, cmd, rest[0]); err != nil {
 			fatal(err)
 		}
-		fmt.Printf("queued %s %s (picked up within ~1s)\n", cmd, rest[0])
+		touchSentinel(dbPath)
+		fmt.Printf("queued %s %s (takes effect immediately)\n", cmd, rest[0])
 	default:
 		usage()
 		os.Exit(2)
@@ -131,6 +134,19 @@ func setControl(db *sql.DB, k, v string) {
 		ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v); err != nil {
 		fatal(err)
 	}
+}
+
+// touchSentinel signals the proxy to consume the rows just written: the
+// proxy watches this file's mtime instead of polling the DB.
+func touchSentinel(dbPath string) {
+	f, err := os.OpenFile(dbPath+".ctl", os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fatal(err)
+	}
+	if _, err := f.Write([]byte("1")); err != nil {
+		fatal(err)
+	}
+	f.Close()
 }
 
 // parseBytes accepts bare bytes or KB/MB/GB/TB/KiB/MiB/GiB/TiB suffixes.

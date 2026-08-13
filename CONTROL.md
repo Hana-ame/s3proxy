@@ -1,14 +1,15 @@
 # s3-proxy 冷热引擎外部控制协议
 
-冷热判定引擎的**全部状态和控制面就是 `state_dir/tier.db`(SQLite)**。没有 HTTP 管理端口:外部程序(脚本、监控、任何语言的 sqlite 客户端)直接打开这个文件,查询随便读,控制写两张约定表。代理进程每 **1 秒**轮询一次控制表,指令即时生效。
+冷热判定引擎的**全部状态和控制面就是 `state_dir/tier.db`(SQLite)**。没有 HTTP 管理端口:外部程序(脚本、监控、任何语言的 sqlite 客户端)直接打开这个文件,查询随便读,控制写两张约定表。代理**不轮询数据库**:行写好后 `touch` 哨兵文件 `tier.db.ctl`,代理收到文件事件后立即消费(毫秒级生效);启动时也会消费一次。
 
 ```
 ┌──────────────┐  只读查询(实时镜像)   ┌──────────────────────────────┐
 │  外部程序     │ ───────────────────▶ │  tier.db (proxy 同一文件)      │
-│ sqlite3 /    │  控制(只写两张表)      │  control:  运行时策略覆盖      │
+│ sqlite3 /    │  控制:写两张表        │  control:  运行时策略覆盖      │
 │ 任意语言      │ ───────────────────▶ │  commands: 一次性强制操作      │
-└──────────────┘                      │  proxy 轮询消费,~1s 生效      │
-                                      └──────────────────────────────┘
+│              │  然后 touch          │  proxy 监听 tier.db.ctl       │
+│              │  tier.db.ctl ──────▶ │  → 立即消费,不轮询            │
+└──────────────┘                      └──────────────────────────────┘
 ```
 
 ## 查询:随便读,只有读
@@ -51,17 +52,20 @@ FROM resources;
 | `promote_on_access` | `"0"` / `"1"` | 冷读是否自动提升回热池,覆盖 `promote_on_access` | |
 | *(其它 k 会被忽略并记录日志)* | | | |
 
-示例(sqlite3 CLI):
+示例(sqlite3 CLI,**写完必须 touch 哨兵**):
 
 ```sh
 # 停机维护:暂停自动迁移
 sqlite3 state/tier.db "INSERT INTO control (k,v) VALUES ('auto_enabled','0')
                        ON CONFLICT(k) DO UPDATE SET v=excluded.v;"
+touch state/tier.db.ctl
 # 改成 1 小时,帮它算毫秒
 sqlite3 state/tier.db "INSERT INTO control (k,v) VALUES ('cold_after_ms','3600000')
                        ON CONFLICT(k) DO UPDATE SET v=excluded.v;"
+touch state/tier.db.ctl
 # 恢复默认
 sqlite3 state/tier.db "DELETE FROM control WHERE k='cold_after_ms';"
+touch state/tier.db.ctl
 ```
 
 ### 2. 一次性强制操作 — `commands(seq, verb, arg)`
@@ -75,7 +79,9 @@ sqlite3 state/tier.db "DELETE FROM control WHERE k='cold_after_ms';"
 
 ```sh
 sqlite3 state/tier.db "INSERT INTO commands (verb, arg) VALUES ('migrate', 'mybucket/old.log');"
+touch state/tier.db.ctl
 sqlite3 state/tier.db "INSERT INTO commands (verb, arg) VALUES ('promote', 'a1b2c3...');"
+touch state/tier.db.ctl
 ```
 
 `migrate`/`promote` 绕过 idle/配额判定,是"手动控制引擎"的通道;与自动迁移的竞态由引擎内的内容锁 + 存储层 re-check 保证一致(输掉的一方干净报错,不会损坏)。
@@ -94,9 +100,12 @@ go run ./cmd/s3-admin state/tier.db migrate mybucket/old.log
 go run ./cmd/s3-admin state/tier.db promote a1b2c3d4e5...
 ```
 
-## 生效延迟
+## 生效时机
 
-控制轮询固定 **1 秒**,`pause/resume`、覆盖值、指令最多 1 秒生效。重启代理时保留的 `control` 行会立即应用(例如维护中暂停,重启后依旧暂停)。
+- **启动时**:消费一次(比如上一轮决定停机暂停,重启后依旧暂停)。
+- **触发时**:外部 touch `tier.db.ctl` 后毫秒级消费(文件监听)。
+- **兜底**:代理每 60 秒 stat 一次哨兵文件(纯 stat,不读 DB),防止文件事件丢失或外部忘了 touch——所以"忘 touch"最多延迟 60 秒,不会永久滞留。
+- 代理自身业务写入**不会**触碰哨兵,哨兵 mtime 变化只代表"外部写了控制行"。
 
 ## 已知限制
 

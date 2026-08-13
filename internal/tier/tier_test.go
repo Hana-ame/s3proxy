@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -631,5 +632,78 @@ func TestControlUnknownKeyIgnored(t *testing.T) {
 	tier.consumeCommands(context.Background())
 	if !tier.autoOn.Load() {
 		t.Fatal("unknown row flipped the pause flag")
+	}
+}
+
+func TestSentinelTriggersConsume(t *testing.T) {
+	// The consumption contract: NOTHING is polled. Rows written to the DB
+	// only take effect after the sentinel file is touched (or at startup).
+	// Caveat that drove the design: the first control design polled the
+	// DB every second; the sentinel event models "admin wrote rows" with
+	// zero steady-state traffic and ~instant pickup.
+	tier, hot, cold, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour,
+	})
+	e := put(t, tier, "bkt", "k", "data")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tier.Run(ctx, 10*time.Millisecond)
+
+	waitTrue := func(cond func() bool, what string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting: %s", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Write a pause row WITHOUT consuming: must have no effect until the
+	// sentinel is touched.
+	setControl(t, tier, "auto_enabled", "0")
+	if !tier.autoOn.Load() {
+		t.Fatal("control row consumed before sentinel trigger")
+	}
+	os.Chtimes(tier.sentinelPath, time.Now(), time.Now())
+	waitTrue(func() bool { return !tier.autoOn.Load() }, "pause consumed via sentinel")
+
+	// While paused, a queued migrate must still run (commands are separate
+	// from the pause gate and always honored).
+	clk.advance(2 * time.Hour)
+	queueCommand(t, tier, "migrate", "bkt/k")
+	if _, err := hot.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("migrated before sentinel trigger")
+	}
+	os.Chtimes(tier.sentinelPath, time.Now(), time.Now())
+	waitTrue(func() bool {
+		_, err := cold.Head(context.Background(), e.ID)
+		return err == nil
+	}, "migrate command consumed via sentinel")
+}
+
+func TestStartupConsumesPersistedControl(t *testing.T) {
+	// Rows written before the process starts are applied at New(): a
+	// pause decided during the previous session must survive a restart.
+	statePath := t.TempDir() + "/tier.db"
+	hot := store.NewMem("hot")
+	cold := store.NewMem("cold")
+	t1, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := t1.db.Exec(`INSERT INTO control (k, v) VALUES ('auto_enabled', '0')`); err != nil {
+		t.Fatal(err)
+	}
+	t1.Close()
+
+	t2, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer t2.Close()
+	if t2.autoOn.Load() {
+		t.Fatal("persisted pause not applied at startup")
 	}
 }
