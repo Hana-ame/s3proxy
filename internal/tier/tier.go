@@ -1,36 +1,53 @@
 // Package tier implements the buffer/tiering policy on top of storage
-// plugins.
+// plugins, with content-addressed deduplication.
 //
-// Every object is placed in exactly one pool and the placement is recorded
-// in a durable index backed by SQLite (tier.db in the state dir):
+// Two layers, mirroring the S3 object model:
 //
-//   - Writes always land in the "hot" pool (the buffer).
-//   - Idle objects (no read for coldAfter, or the hot pool exceeding
-//     maxHotBytes) are streamed to a "cold" pool (remote S3 / second local)
-//     by the background migration loop: the buffer drains itself.
-//   - Reads served from a cold pool can promote the object back to hot
-//     (promoteOnAccess), turning the policy into a two-level cache.
+//   - objects (the name layer): "bucket/key" -> content id (sha256 of the
+//     bytes) plus per-key metadata (ContentType, x-amz-meta-*, times).
+//     Multiple keys can reference the same id; a copy is then a pure
+//     mapping insert (zero bytes moved).
+//   - resources (the content layer): id -> the pool physically holding the
+//     bytes, refcount, size and entity tag. Every id exists at most once
+//     across all pools: same content uploaded to different keys shares one
+//     resource ("content dedup").
 //
-// The index is the frontend's metadata truth (ETag, ContentType, size,
-// times, storage class); pools only hold bytes. Reads cross-check the
-// recorded pool and heal the index when a crashed migration left the object
-// elsewhere.
+// Pools store bytes keyed by the content id (not by bucket/key), so the
+// name layer is the ONLY place that knows names. Consequences, documented
+// up front:
 //
-// Persistence design: the in-memory maps are the runtime truth; SQLite is a
-// write-through mirror (one UPSERT/DELETE row per mutation, WAL mode) so a
-// restart restores the full index. The previous design rewrote the whole
-// index as one JSON file per mutation, which is O(N) per write and loses
-// LastAccess on crash (touch was memory-only, so a restart immediately
-// considered every object idle and drained the buffer). SQLite makes both
-// incremental row writes AND durable access times practical.
+//   - Rebuild() can restore resources from a pool listing, but never the
+//     name layer — bucket/key names are not recoverable from content
+//     addressing. After a lost index, names are gone for good.
+//   - S3 cold pools must run in prefix mode (single remote bucket for all
+//     ids); per-bucket mode conflicts with global dedup. main validates.
+//   - Overwriting a key releases the old content's refcount immediately;
+//     there is no versioning (a previous version is deleted as soon as its
+//     last reference disappears).
+//
+// Tiering policy on top: writes always land in the hot pool; idle
+// resources (no access for coldAfter, or the hot pool exceeding
+// maxHotBytes) are migrated to a cold pool by the background loop;
+// reads from a cold pool can promote the resource back to hot.
+// The LastAccess of a resource is the max over its referencing keys, so
+// deduplicated content benefits from the accesses of all its aliases.
+//
+// Persistence: SQLite (WAL, single writer connection) mirrors the in-memory
+// maps with one row write per mutation; access times are durable so a
+// restart never drains the buffer instantly (a failure of the previous
+// JSON-index design, where touch was memory-only).
 package tier
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -45,16 +62,19 @@ import (
 	"s3proxy/internal/store"
 )
 
-// Entry is the authoritative metadata record for one object.
+// Entry is the aggregate view the frontend consumes: per-key metadata from
+// the name layer joined with content facts (size, etag, pool placement)
+// from the resource layer.
 type Entry struct {
-	Pool         string            `json:"pool"` // pool name recorded in stores
-	Size         int64             `json:"size"`
-	ETag         string            `json:"etag"` // quoted, as S3 clients expect
-	ContentType  string            `json:"content_type"`
-	StorageClass string            `json:"storage_class"`
-	Metadata     map[string]string `json:"metadata,omitempty"` // x-amz-meta-*
-	LastModified time.Time         `json:"last_modified"`
-	LastAccess   time.Time         `json:"last_access"` // touched in memory on read
+	ID           string // content id (sha256 hex)
+	Pool         string // pool name physically holding the bytes
+	Size         int64
+	ETag         string // quoted, as S3 clients expect
+	ContentType  string
+	StorageClass string
+	Metadata     map[string]string // x-amz-meta-* (per key)
+	LastModified time.Time         // when this KEY was last written
+	LastAccess   time.Time         // last read of this KEY
 }
 
 // PutOpts groups per-write options from the frontend.
@@ -69,10 +89,30 @@ type PutOpts struct {
 type Config struct {
 	Hot             string        // pool name receiving all writes
 	Cold            []string      // drain targets, tried round-robin
-	ColdAfter       time.Duration // idle time before an object qualifies as cold
+	ColdAfter       time.Duration // idle time before a resource qualifies as cold
 	ScanInterval    time.Duration // migration loop period
-	MaxHotBytes     int64         // 0 = unlimited; else evict oldest hot objects over quota
-	PromoteOnAccess bool          // read a cold object -> move it back to hot
+	MaxHotBytes     int64         // 0 = unlimited; else evict oldest hot resources over quota
+	PromoteOnAccess bool          // read a cold resource -> move it back to hot
+}
+
+// objRow is the name layer: one row per key.
+type objRow struct {
+	ID           string
+	ContentType  string
+	StorageClass string
+	Metadata     map[string]string
+	LastModified time.Time
+	LastAccess   time.Time
+}
+
+// resRow is the content layer: one row per unique bytes.
+type resRow struct {
+	Pool         string
+	Refs         int
+	Size         int64
+	ETag         string
+	LastModified time.Time
+	LastAccess   time.Time // max of referencing keys' access
 }
 
 // TieredStore mediates frontend operations across the configured pools.
@@ -84,18 +124,24 @@ type TieredStore struct {
 	statePath string
 	db        *sql.DB
 	mu        sync.Mutex
-	idx       map[string]*Entry // "bucket/key" -> entry
+	idx       map[string]*objRow // "bucket/key" -> name row
+	res       map[string]*resRow // content id -> resource row
 	buckets   map[string]time.Time
 
-	// Prepared statements (single writer connection, so they are safe to
-	// reuse; see New).
-	upEntry   *sql.Stmt
-	delEntry  *sql.Stmt
+	upObj     *sql.Stmt
+	delObj    *sql.Stmt
+	upRes     *sql.Stmt
+	refsUp    *sql.Stmt // refs = refs + 1 (or insert as 0, caller then bumps)
+	refsDrop  *sql.Stmt // refs = refs - 1 on a resource that exists
+	delRes    *sql.Stmt
 	upBucket  *sql.Stmt
 	delBucket *sql.Stmt
 
-	keyLocks sync.Map // key -> *sync.Mutex, serializes byte moves per object
-	rr       uint64   // round-robin cursor across cold pools
+	keyLocks sync.Map // lock name -> *sync.Mutex; use fullKey for name-layer
+	// ops, content id for resource-layer ops. Never re-entered (documented
+	// promote deadlock history: transfer used to be called while holding a
+	// key lock).
+	rr uint64 // round-robin cursor across cold pools
 }
 
 // SetNow injects a test clock. Not for production use.
@@ -119,12 +165,19 @@ func openDB(path string) (*sql.DB, error) {
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS objects (
   fk            TEXT PRIMARY KEY,
-  pool          TEXT NOT NULL,
-  size          INTEGER NOT NULL,
-  etag          TEXT NOT NULL DEFAULT '',
+  id            TEXT NOT NULL,
   content_type  TEXT NOT NULL DEFAULT '',
   storage_class TEXT NOT NULL DEFAULT '',
   metadata      TEXT NOT NULL DEFAULT '',
+  last_modified TEXT NOT NULL,
+  last_access   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resources (
+  id            TEXT PRIMARY KEY,
+  pool          TEXT NOT NULL,
+  refs          INTEGER NOT NULL,
+  size          INTEGER NOT NULL,
+  etag          TEXT NOT NULL DEFAULT '',
   last_modified TEXT NOT NULL,
   last_access   TEXT NOT NULL
 );
@@ -133,19 +186,14 @@ CREATE TABLE IF NOT EXISTS buckets (
   created TEXT NOT NULL
 );`
 
-// entryIsZero reports the zero Entry (an object whose metadata is
-// impossible: empty pool). Used by Rebuild to skip unknown rows.
-func entryIsZero(e *Entry) bool { return e.Pool == "" }
-
 // New creates the tiered store. The index lives in the SQLite file at
-// statePath. If the file is missing or unreadable (corrupt), the index is
-// rebuilt by listing every pool.
+// statePath. If the file is missing or unreadable (corrupt), the content
+// layer is rebuilt by listing every pool; the name layer (key -> id,
+// buckets) cannot be recovered from content addressing and is lost —
+// documented in the package comment.
 func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error) {
 	_, statErr := os.Stat(statePath)
 	needsRebuild := errors.Is(statErr, os.ErrNotExist)
-	// DB is created (with schema) in openDB regardless; needsRebuild only
-	// records that this is a fresh start, so loadIndex skips the read and
-	// New rebuilds from the pools below.
 
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 		return nil, err
@@ -160,7 +208,8 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		now:       time.Now,
 		statePath: statePath,
 		db:        db,
-		idx:       make(map[string]*Entry),
+		idx:       make(map[string]*objRow),
+		res:       make(map[string]*resRow),
 		buckets:   make(map[string]time.Time),
 	}
 	for _, p := range pools {
@@ -180,12 +229,17 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		db.Close()
 		return nil, fmt.Errorf("tier: init schema: %w", err)
 	}
-	for name, stmt := range map[string]**sql.Stmt{
-		"upEntry":   &t.upEntry,
-		"delEntry":  &t.delEntry,
+	statements := map[string]**sql.Stmt{
+		"upObj":     &t.upObj,
+		"delObj":    &t.delObj,
+		"upRes":     &t.upRes,
+		"refsUp":    &t.refsUp,
+		"refsDrop":  &t.refsDrop,
+		"delRes":    &t.delRes,
 		"upBucket":  &t.upBucket,
 		"delBucket": &t.delBucket,
-	} {
+	}
+	for name, stmt := range statements {
 		*stmt, err = db.Prepare(stmtSQL(name))
 		if err != nil {
 			db.Close()
@@ -195,8 +249,6 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 	if !needsRebuild {
 		if err := t.loadIndex(); err != nil {
 			log.Printf("tier: index rebuild (load failed: %v)", err)
-			// A corrupt DB cannot accept the rebuild's writes; drop the
-			// file completely and start the index from the pools.
 			db.Close()
 			if rmErr := os.Remove(statePath); rmErr != nil {
 				return nil, fmt.Errorf("tier: removing corrupt db: %w", rmErr)
@@ -221,20 +273,32 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 	return t, nil
 }
 
-// stmtSQL returns the SQL text for a prepared statement name. Kept out of
-// New to keep the init flow readable.
+// stmtSQL returns the SQL text for a prepared statement name.
 func stmtSQL(name string) string {
 	switch name {
-	case "upEntry":
-		return `INSERT INTO objects (fk, pool, size, etag, content_type, storage_class, metadata, last_modified, last_access)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	case "upObj":
+		return `INSERT INTO objects (fk, id, content_type, storage_class, metadata, last_modified, last_access)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(fk) DO UPDATE SET
-  pool=excluded.pool, size=excluded.size, etag=excluded.etag,
-  content_type=excluded.content_type, storage_class=excluded.storage_class,
-  metadata=excluded.metadata, last_modified=excluded.last_modified,
-  last_access=excluded.last_access`
-	case "delEntry":
+  id=excluded.id, content_type=excluded.content_type,
+  storage_class=excluded.storage_class, metadata=excluded.metadata,
+  last_modified=excluded.last_modified, last_access=excluded.last_access`
+	case "delObj":
 		return `DELETE FROM objects WHERE fk = ?`
+	case "upRes":
+		return `INSERT INTO resources (id, pool, refs, size, etag, last_modified, last_access)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  pool=excluded.pool, size=excluded.size, etag=excluded.etag,
+  last_modified=excluded.last_modified, last_access=excluded.last_access`
+	case "refsUp":
+		// Used when a resource already exists (dedup hit): +1 and keep the
+		// existing facts (bytes, placement) untouched.
+		return `UPDATE resources SET refs = refs + 1, last_access = max(last_access, ?) WHERE id = ?`
+	case "refsDrop":
+		return `UPDATE resources SET refs = refs - 1 WHERE id = ?`
+	case "delRes":
+		return `DELETE FROM resources WHERE id = ?`
 	case "upBucket":
 		return `INSERT INTO buckets (bucket, created) VALUES (?, ?)
 ON CONFLICT(bucket) DO UPDATE SET created=excluded.created`
@@ -253,6 +317,12 @@ func (t *TieredStore) colds() []store.Store {
 	return res
 }
 
+func (t *TieredStore) allPools() []store.Store {
+	res := []store.Store{t.hot()}
+	res = append(res, t.colds()...)
+	return res
+}
+
 func fullKey(bucket, key string) string { return bucket + "/" + key }
 
 func splitKey(fk string) (bucket, key string) {
@@ -260,12 +330,13 @@ func splitKey(fk string) (bucket, key string) {
 	return b, rest
 }
 
-// lockKey serializes byte-moves (Put/Delete/migrate/promote) per object.
-// Without it a migration could overwrite a concurrent PUT's fresh copy in
-// the hot pool with the stale bytes it already read (race documented at
-// migrate). Reads do not take the lock: they only observe placement.
-func (t *TieredStore) lockKey(fk string) func() {
-	m, _ := t.keyLocks.LoadOrStore(fk, &sync.Mutex{})
+// lockKey serializes mutations per lock name. Namespaces: "bucket/key" for
+// name-layer ops (Put/Delete/Copy of one key) and the content id for
+// resource-layer ops (register/transfer/refcount). Callers must never call
+// it twice in one goroutine on the same name: sync.Mutex is not reentrant,
+// and a promote deadlock built on that mistake is documented at promote.
+func (t *TieredStore) lockKey(name string) func() {
+	m, _ := t.keyLocks.LoadOrStore(name, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
@@ -274,114 +345,133 @@ func (t *TieredStore) lockKey(fk string) func() {
 // ---------------------------------------------------------------------------
 // index persistence
 
-// loadIndex reads the whole SQLite index into memory. Called once at
-// startup on the single connection; columns are stored as RFC3339Nano UTC
-// strings, metadata as a JSON map.
+// tsString encodes a time for the DB (UTC RFC3339Nano).
+func tsString(tt time.Time) string { return tt.UTC().Format(time.RFC3339Nano) }
+
+func parseTS(s string) (time.Time, error) { return time.Parse(time.RFC3339Nano, s) }
+
 func (t *TieredStore) loadIndex() error {
-	rows, err := t.db.Query(`SELECT fk, pool, size, etag, content_type, storage_class, metadata, last_modified, last_access FROM objects`)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rows, err := t.db.Query(`SELECT fk, id, content_type, storage_class, metadata, last_modified, last_access FROM objects`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	idx := make(map[string]*Entry)
 	for rows.Next() {
-		var (
-			fk, pool, etag, ct, sc, metaJSON, lmStr, laStr string
-			size                                           int64
-		)
-		if err := rows.Scan(&fk, &pool, &size, &etag, &ct, &sc, &metaJSON, &lmStr, &laStr); err != nil {
+		var fk, id, ct, sc, meta, lm, la string
+		if err := rows.Scan(&fk, &id, &ct, &sc, &meta, &lm, &la); err != nil {
 			return err
 		}
-		e := &Entry{Pool: pool, Size: size, ETag: etag, ContentType: ct, StorageClass: sc}
-		if metaJSON != "" {
-			json.Unmarshal([]byte(metaJSON), &e.Metadata)
+		o := &objRow{ID: id, ContentType: ct, StorageClass: sc}
+		if meta != "" {
+			json.Unmarshal([]byte(meta), &o.Metadata)
 		}
-		if lm, err := time.Parse(time.RFC3339Nano, lmStr); err == nil {
-			e.LastModified = lm
+		if v, err := parseTS(lm); err == nil {
+			o.LastModified = v
 		}
-		if la, err := time.Parse(time.RFC3339Nano, laStr); err == nil {
-			e.LastAccess = la
+		if v, err := parseTS(la); err == nil {
+			o.LastAccess = v
 		}
-		idx[fk] = e
+		t.idx[fk] = o
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	rows.Close()
+
+	rrows, err := t.db.Query(`SELECT id, pool, refs, size, etag, last_modified, last_access FROM resources`)
+	if err != nil {
+		return err
+	}
+	defer rrows.Close()
+	for rrows.Next() {
+		var id, pool, etag, lm, la string
+		var refs int
+		var size int64
+		if err := rrows.Scan(&id, &pool, &refs, &size, &etag, &lm, &la); err != nil {
+			return err
+		}
+		r := &resRow{Pool: pool, Refs: refs, Size: size, ETag: etag}
+		if v, err := parseTS(lm); err == nil {
+			r.LastModified = v
+		}
+		if v, err := parseTS(la); err == nil {
+			r.LastAccess = v
+		}
+		t.res[id] = r
+	}
+	if err := rrows.Err(); err != nil {
+		return err
+	}
+	rrows.Close()
+
 	brows, err := t.db.Query(`SELECT bucket, created FROM buckets`)
 	if err != nil {
 		return err
 	}
 	defer brows.Close()
-	buckets := make(map[string]time.Time)
 	for brows.Next() {
-		var b, createdStr string
-		if err := brows.Scan(&b, &createdStr); err != nil {
+		var b, created string
+		if err := brows.Scan(&b, &created); err != nil {
 			return err
 		}
-		if created, err := time.Parse(time.RFC3339Nano, createdStr); err == nil {
-			buckets[b] = created
+		if v, err := parseTS(created); err == nil {
+			t.buckets[b] = v
 		}
 	}
-	if err := brows.Err(); err != nil {
-		return err
-	}
-	t.mu.Lock()
-	t.idx = idx
-	t.buckets = buckets
-	t.mu.Unlock()
-	return nil
+	return brows.Err()
 }
 
-// tsString encodes a time for the DB (UTC RFC3339Nano, stable lexicographic
-// ordering for scans).
-func tsString(tt time.Time) string { return tt.UTC().Format(time.RFC3339Nano) }
-
-// entryRow serializes an Entry into its column values.
-func entryRow(e *Entry) (fk, pool, etag, ct, sc, metaJSON, lm, la string, size int64) {
+// upsertObjLocked / delObjLocked / upsertResLocked / delResLocked /
+// upBucketLocked / delBucketLocked: write-through mirror rows. Callers hold
+// t.mu (and usually a business lock as well; t.mu is always the inner lock
+// so lock ordering is uniform).
+func (t *TieredStore) upsertObjLocked(fk string, o *objRow) error {
 	meta := ""
-	if len(e.Metadata) > 0 {
-		if b, err := json.Marshal(e.Metadata); err == nil {
+	if len(o.Metadata) > 0 {
+		if b, err := json.Marshal(o.Metadata); err == nil {
 			meta = string(b)
 		}
 	}
-	return "", e.Pool, e.ETag, e.ContentType, e.StorageClass, meta, tsString(e.LastModified), tsString(e.LastAccess), e.Size
-}
-
-// upsertEntryLocked write-throughs one object row. Callers must hold t.mu
-// (the in-memory map and the DB mirror must never diverge).
-func (t *TieredStore) upsertEntryLocked(fk string, e *Entry) error {
-	_, pool, etag, ct, sc, meta, lm, la, size := entryRow(e)
-	_, err := t.upEntry.Exec(fk, pool, size, etag, ct, sc, meta, lm, la)
+	_, err := t.upObj.Exec(fk, o.ID, o.ContentType, o.StorageClass, meta, tsString(o.LastModified), tsString(o.LastAccess))
 	return err
 }
 
-// deleteEntryLocked removes one object row. Callers must hold t.mu.
-func (t *TieredStore) deleteEntryLocked(fk string) error {
-	_, err := t.delEntry.Exec(fk)
+func (t *TieredStore) delObjLocked(fk string) error {
+	_, err := t.delObj.Exec(fk)
 	return err
 }
 
-// upsertBucketLocked writes one bucket row. Callers must hold t.mu.
-func (t *TieredStore) upsertBucketLocked(bucket string, created time.Time) error {
+func (t *TieredStore) upsertResLocked(id string, r *resRow) error {
+	_, err := t.upRes.Exec(id, r.Pool, r.Refs, r.Size, r.ETag, tsString(r.LastModified), tsString(r.LastAccess))
+	return err
+}
+
+func (t *TieredStore) delResLocked(id string) error {
+	_, err := t.delRes.Exec(id)
+	return err
+}
+
+func (t *TieredStore) upBucketLocked(bucket string, created time.Time) error {
 	_, err := t.upBucket.Exec(bucket, tsString(created))
 	return err
 }
 
-// deleteBucketLocked removes one bucket row. Callers must hold t.mu.
-func (t *TieredStore) deleteBucketLocked(bucket string) error {
+func (t *TieredStore) delBucketLocked(bucket string) error {
 	_, err := t.delBucket.Exec(bucket)
 	return err
 }
 
-// Rebuild reconstructs the index from the pools. Source of truth fallback
-// used by New, and by ops tests to simulate history. Duplicates (a crash mid
-// migration can briefly leave both copies) resolve to the newest
-// LastModified, then to the earlier-listed pool. Metadata is lost here by
-// design: pool List() only returns core fields.
+// Rebuild reconstructs the CONTENT layer from the pools; the name layer is
+// unrecoverable from content addressing (documented in the package
+// comment), so it logs a warning and starts empty. Resources come back with
+// refs=0: they are unreferenced orphans until a future upload of the same
+// content dedups into them. Duplicates across pools resolve to the newest
+// LastModified, then to the later-listed pool (hot wins ties by listing
+// colds first).
 func (t *TieredStore) Rebuild() error {
-	seen := make(map[string]*Entry)
-	buckets := make(map[string]time.Time)
+	seen := make(map[string]*resRow)
 	for _, p := range append(t.colds(), t.hot()) {
 		startAfter := ""
 		for {
@@ -390,21 +480,21 @@ func (t *TieredStore) Rebuild() error {
 				return fmt.Errorf("tier: rebuild list %s: %w", p.Name(), err)
 			}
 			for _, it := range pg.Entries {
+				// Stray temporary keys (interrupted content-hash writes)
+				// are never resource names.
+				if strings.HasPrefix(it.Key, tmpPrefix) {
+					continue
+				}
 				prev, ok := seen[it.Key]
 				if !ok || it.LastModified.After(prev.LastModified) {
-					seen[it.Key] = &Entry{
+					seen[it.Key] = &resRow{
 						Pool:         p.Name(),
+						Refs:         0,
 						Size:         it.Size,
 						ETag:         it.ETag,
-						ContentType:  it.ContentType,
-						StorageClass: it.StorageClass,
 						LastModified: it.LastModified,
 						LastAccess:   it.LastModified,
 					}
-				}
-				b, _, _ := strings.Cut(it.Key, "/")
-				if _, ok := buckets[b]; !ok {
-					buckets[b] = it.LastModified
 				}
 			}
 			if !pg.IsTruncated || pg.NextToken == "" {
@@ -415,264 +505,477 @@ func (t *TieredStore) Rebuild() error {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// Replace the persisted index inside one transaction so a crash during
-	// rebuild leaves either the old or the new index, never a mix.
 	tx, err := t.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM objects`); err != nil {
+	if _, err := tx.Exec(`DELETE FROM resources`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM buckets`); err != nil {
-		return err
-	}
-	for fk, e := range seen {
-		_, pool, etag, ct, sc, meta, lm, la, size := entryRow(e)
-		if _, err := tx.Exec(`INSERT INTO objects (fk, pool, size, etag, content_type, storage_class, metadata, last_modified, last_access) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, fk, pool, size, etag, ct, sc, meta, lm, la); err != nil {
-			return err
-		}
-	}
-	for b, created := range buckets {
-		if _, err := tx.Exec(`INSERT INTO buckets (bucket, created) VALUES (?, ?)`, b, tsString(created)); err != nil {
+	for id, r := range seen {
+		if _, err := tx.Exec(`INSERT INTO resources (id, pool, refs, size, etag, last_modified, last_access) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			id, r.Pool, r.Refs, r.Size, r.ETag, tsString(r.LastModified), tsString(r.LastAccess)); err != nil {
 			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	t.idx = seen
-	t.buckets = buckets
+	t.res = seen
+	t.idx = make(map[string]*objRow)
+	t.buckets = make(map[string]time.Time)
+	log.Printf("tier: rebuild: name layer lost (keys/buckets unrecoverable from content ids)")
 	return nil
 }
 
 // ---------------------------------------------------------------------------
 // object operations
 
-// PutObject writes bytes into the hot (buffer) pool, then removes any stale
-// copy from cold pools so reads never serve outdated data. opts.ETag
-// overrides the recorded ETag (multipart complete passes the composite etag;
-// the assembled bytes' own md5 would not match what S3 clients expect). Locks
-// the key so a concurrent migration cannot clobber the fresh copy.
+// tmpPrefix names in-flight content-hash writes. Bytes stream to
+// "tmp/<nonce>"; once the sha256 is known the entry is renamed to the id (or
+// deleted on a dedup hit).
+const tmpPrefix = "tmp/"
+
+func newTmpKey() string {
+	var b [16]byte
+	rand.Read(b[:])
+	return tmpPrefix + hex.EncodeToString(b[:])
+}
+
+// contentID returns a sha256 writer; the id is a function of the object
+// bytes, always (multipart composite etags are stored on the resource, not
+// used as the id).
+func contentID() hash.Hash { return sha256.New() }
+
+// PutObject stream-writes into the hot pool under a temporary key while
+// hashing the bytes, then finalizes the content-addressed registration:
+//
+//   - existing id (dedup hit): temp bytes are deleted, refcount++.
+//   - new id: temp is renamed to the id, resource row created, refs=1.
+//
+// Whatever the old mapping of this key was is released afterwards
+// (refcount--; the resource is deleted when its refcount reaches zero,
+// which also removes the bytes from every pool). Registration and release
+// serialize on the content-id lock; the key lock serializes concurrent
+// writes to the same key.
 func (t *TieredStore) PutObject(ctx context.Context, bucket, key string, r io.Reader, size int64, opts PutOpts) (Entry, error) {
 	fk := fullKey(bucket, key)
 	unlock := t.lockKey(fk)
 	defer unlock()
 
 	hot := t.hot()
-	info, err := hot.Put(ctx, fk, r, size, opts.ContentType, store.PutOptions{
+	// Ensure the resource bucket on the pool. Content-addressed resources
+	// live in a fixed "data" namespace: prefix-mode S3 pools map it to
+	// their configured bucket; per-bucket pools are rejected in config.
+	if err := hot.EnsureBucket(ctx, "data"); err != nil {
+		return Entry{}, err
+	}
+
+	tmpKey := newTmpKey()
+	h := contentID()
+	hashed := io.TeeReader(r, h)
+	info, err := hot.Put(ctx, tmpKey, hashed, size, opts.ContentType, store.PutOptions{
 		ETag:              opts.ETag,
 		StorageClass:      opts.StorageClass,
 		RequestedMetadata: opts.Metadata,
 	})
 	if err != nil {
-		// Backend may not know the bucket yet (remote S3 pools require an
-		// explicit CreateBucket). Retry once after ensuring it.
-		if errors.Is(err, store.ErrNotFound) {
-			if ebErr := hot.EnsureBucket(ctx, bucket); ebErr == nil {
-				var retry store.ObjectInfo
-				retry, err = hot.Put(ctx, fk, r, size, opts.ContentType, store.PutOptions{ETag: opts.ETag})
-				info = retry
-			}
-		}
-		if err != nil {
-			return Entry{}, err
-		}
+		return Entry{}, err
 	}
-	// An explicit opts.ETag always wins: multipart complete passes the
-	// composite etag, and backends (mem, S3) report their own md5 of the
-	// assembled bytes which S3 clients would reject as a plain etag.
+	id := hex.EncodeToString(h.Sum(nil))
 	if opts.ETag != "" {
 		info.ETag = opts.ETag
 	}
+
+	unlockRes := t.lockKey(id)
+	defer unlockRes()
+
+	t.mu.Lock()
+	existing, exists := t.res[id]
+	oldID := ""
+	if old, ok := t.idx[fk]; ok {
+		oldID = old.ID
+	}
+	t.mu.Unlock()
+
+	now := t.now()
+	if exists {
+		// Dedup hit: the bytes are already registered; drop the copy we
+		// just streamed and bump the refcount below.
+		if err := hot.Delete(ctx, tmpKey); err != nil {
+			log.Printf("tier: dedup tmp cleanup: %v", err)
+		}
+	} else {
+		if err := renameInPool(hot, ctx, tmpKey, id); err != nil {
+			return Entry{}, err
+		}
+		existing = &resRow{
+			Pool:         hot.Name(),
+			Size:         info.Size,
+			ETag:         info.ETag,
+			LastModified: now,
+			LastAccess:   now,
+		}
+		t.mu.Lock()
+		t.res[id] = existing
+		t.mu.Unlock()
+	}
+
+	// Refcount bookkeeping: +1 for this key, -1 for the key's previous
+	// content. Releases the old resource when its refcount reaches zero.
+	// Discovery background: the table row used to be written BEFORE the
+	// increment (and not at all on dedup hits), so refcounts silently
+	// persisted as 0/1 and duplicates resurfaced after a restart — the
+	// restart test caught it. The single upsert below always carries the
+	// final refcount.
+	t.mu.Lock()
+	if oldID != "" && oldID != id {
+		if old, ok := t.res[oldID]; ok {
+			old.Refs--
+			if old.Refs <= 0 {
+				delete(t.res, oldID)
+				t.delResLocked(oldID)
+				t.mu.Unlock()
+				t.sweepAll(ctx, oldID)
+				t.mu.Lock()
+				log.Printf("tier: released content %s (refcount 0)", shortID(oldID))
+			} else if err := t.upsertResLocked(oldID, old); err != nil {
+				t.mu.Unlock()
+				return Entry{}, err
+			}
+		}
+	}
+	existing.Refs++
+	if err := t.upsertResLocked(id, existing); err != nil {
+		t.mu.Unlock()
+		return Entry{}, err
+	}
 	e := Entry{
-		Pool:         hot.Name(),
-		Size:         info.Size,
-		ETag:         info.ETag,
+		ID:           id,
+		Pool:         existing.Pool,
+		Size:         existing.Size,
+		ETag:         existing.ETag,
 		ContentType:  opts.ContentType,
 		StorageClass: opts.StorageClass,
 		Metadata:     opts.Metadata,
-		LastModified: info.LastModified,
-		LastAccess:   t.now(),
+		LastModified: now,
+		LastAccess:   now,
+	}
+	o := &objRow{
+		ID:           id,
+		ContentType:  opts.ContentType,
+		StorageClass: opts.StorageClass,
+		Metadata:     opts.Metadata,
+		LastModified: now,
+		LastAccess:   now,
 	}
 	if e.StorageClass == "" {
 		e.StorageClass = "STANDARD"
+		o.StorageClass = "STANDARD"
 	}
 	if e.ContentType == "" {
 		e.ContentType = "application/octet-stream"
+		o.ContentType = "application/octet-stream"
 	}
-
-	// Sweep stale copies from every other pool (covers crashed-migration
-	// leftovers) before the index moves to the fresh copy.
-	for _, p := range append(t.colds(), hot) {
-		if p.Name() == hot.Name() {
-			continue
-		}
-		if err := p.Delete(ctx, fk); err != nil {
-			log.Printf("tier: stale sweep %s: %v", p.Name(), err)
-		}
+	t.idx[fk] = o
+	t.buckets[bucket] = now
+	if err := t.upsertObjLocked(fk, o); err != nil {
+		t.mu.Unlock()
+		return Entry{}, err
 	}
-
-	t.mu.Lock()
-	t.idx[fk] = &e
-	created := t.now()
-	t.buckets[bucket] = created
-	err = t.upsertEntryLocked(fk, &e)
-	if err == nil {
-		err = t.upsertBucketLocked(bucket, created)
+	if err := t.upBucketLocked(bucket, now); err != nil {
+		t.mu.Unlock()
+		return Entry{}, err
 	}
 	t.mu.Unlock()
-	return e, err
+	return e, nil
 }
 
-// GetObject streams bytes of an object placed anywhere in the tiers. On the
-// first pool read failing with ErrNotFound it probes every other pool and
-// heals the index (a crashed migration may have left the object physically
-// elsewhere than the index says). A hit from a cold pool optionally promotes
-// the object back to hot (async).
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// renameInPool moves a temporary key to its final content-id key, using the
+// plugin's native rename when available and copy+delete otherwise.
+func renameInPool(p store.Store, ctx context.Context, fromKey, toKey string) error {
+	if rn, ok := p.(store.Renamer); ok {
+		return rn.Rename(ctx, fromKey, toKey)
+	}
+	res, err := p.Get(ctx, fromKey, store.Range{Start: 0, End: -1})
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if _, err := p.Put(ctx, toKey, res.Body, res.Info.Size, res.Info.ContentType, store.PutOptions{}); err != nil {
+		return err
+	}
+	return p.Delete(ctx, fromKey)
+}
+
+// sweepAll deletes the content id from every pool (refcount reached zero).
+func (t *TieredStore) sweepAll(ctx context.Context, id string) {
+	for _, p := range t.allPools() {
+		if err := p.Delete(ctx, id); err != nil {
+			log.Printf("tier: sweep %s %s: %v", p.Name(), id, err)
+		}
+	}
+}
+
+// CopyObject (S3 CopyObject / the dedup fast path): the destination is a
+// mapping insert referencing the source content id — zero bytes moved.
+func (t *TieredStore) CopyObject(ctx context.Context, dstBucket, dstKey, srcBucket, srcKey string) (Entry, error) {
+	fk := fullKey(dstBucket, dstKey)
+	unlock := t.lockKey(fk)
+	defer unlock()
+
+	t.mu.Lock()
+	src, ok := t.idx[fullKey(srcBucket, srcKey)]
+	t.mu.Unlock()
+	if !ok {
+		return Entry{}, store.ErrNotFound
+	}
+	id := src.ID
+
+	unlockRes := t.lockKey(id)
+	defer unlockRes()
+
+	t.mu.Lock()
+	cur, ok := t.res[id]
+	if !ok {
+		t.mu.Unlock()
+		return Entry{}, store.ErrNotFound
+	}
+	now := t.now()
+	// Release the destination's previous content, if any.
+	if old, hasOld := t.idx[fk]; hasOld && old.ID != id {
+		if r, ok := t.res[old.ID]; ok {
+			r.Refs--
+			if r.Refs <= 0 {
+				delete(t.res, old.ID)
+				t.delResLocked(old.ID)
+				t.mu.Unlock()
+				unlockRes() // release the NEW id lock before sweeping OLD id
+				t.sweepAll(ctx, old.ID)
+				unlockRes = t.lockKey(id)
+				t.mu.Lock()
+			} else if err := t.upsertResLocked(old.ID, r); err != nil {
+				t.mu.Unlock()
+				return Entry{}, err
+			}
+		}
+	}
+	cur.Refs++
+	e := Entry{
+		ID:           id,
+		Pool:         cur.Pool,
+		Size:         cur.Size,
+		ETag:         cur.ETag,
+		ContentType:  src.ContentType,
+		StorageClass: src.StorageClass,
+		Metadata:     src.Metadata,
+		LastModified: now,
+		LastAccess:   now,
+	}
+	o := &objRow{
+		ID:           id,
+		ContentType:  src.ContentType,
+		StorageClass: src.StorageClass,
+		Metadata:     src.Metadata,
+		LastModified: now,
+		LastAccess:   now,
+	}
+	if e.StorageClass == "" {
+		e.StorageClass = "STANDARD"
+		o.StorageClass = "STANDARD"
+	}
+	if e.ContentType == "" {
+		e.ContentType = "application/octet-stream"
+		o.ContentType = "application/octet-stream"
+	}
+	t.idx[fk] = o
+	t.buckets[dstBucket] = now
+	if err := t.upsertObjLocked(fk, o); err != nil {
+		t.mu.Unlock()
+		return Entry{}, err
+	}
+	t.mu.Unlock()
+	return e, nil
+}
+
+// GetObject streams bytes of the resource behind a key. The per-key entry
+// is resolved, the resource's pool serves the range; on a pool miss the
+// index is healed by probing other pools (crashed migration recovery).
 func (t *TieredStore) GetObject(ctx context.Context, bucket, key string, rng store.Range) (store.GetResult, Entry, error) {
 	fk := fullKey(bucket, key)
-	var res store.GetResult
 	e, err := t.getEntry(fk)
 	if err != nil {
-		return res, Entry{}, err
+		return store.GetResult{}, Entry{}, err
 	}
-	// Snapshot the entry; the index itself is used for placement, but we
-	// report this snapshot (with a fresh access timestamp) to the api
-	// layer so ETag/etag never race with a concurrent migration.
-	eCopy := e
-	eCopy.LastAccess = t.now()
-
-	// Copy the result span; promoted reads reset the range so the
-	// eventual re-fetch from hot serves the same bytes.
-	targetRange := rng
-	res, err = t.pools[eCopy.Pool].Get(ctx, fk, targetRange)
+	res, err := t.pools[e.Pool].Get(ctx, e.ID, rng)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
-			return res, eCopy, err
+			return store.GetResult{}, e, err
 		}
-		healed, hErr := t.probeAndHeal(ctx, fk)
+		healed, hErr := t.heal(ctx, e.ID)
 		if hErr != nil {
-			return res, eCopy, store.ErrNotFound
+			return store.GetResult{}, e, store.ErrNotFound
 		}
-		eCopy = healed
-		res, err = t.pools[healed.Pool].Get(ctx, fk, targetRange)
+		e.Pool = healed.Pool
+		res, err = t.pools[healed.Pool].Get(ctx, e.ID, rng)
 		if err != nil {
-			return res, eCopy, err
+			return store.GetResult{}, e, err
 		}
 	}
-
-	t.touch(fk)
-	if t.cfg.PromoteOnAccess && eCopy.Pool != t.cfg.Hot {
-		go t.promote(ctx, fk, res.Info)
+	t.touch(fk, e.ID)
+	if t.cfg.PromoteOnAccess && e.Pool != t.cfg.Hot {
+		go t.promote(ctx, e.ID)
 	}
-	return res, eCopy, nil
+	return res, e, nil
 }
 
-// HeadObject mirrors GetObject but without a body; still touches access time
-// and heals placement on mismatch.
+// HeadObject mirrors GetObject without a body.
 func (t *TieredStore) HeadObject(ctx context.Context, bucket, key string) (Entry, error) {
 	fk := fullKey(bucket, key)
 	e, err := t.getEntry(fk)
 	if err != nil {
 		return e, err
 	}
-	_, err = t.pools[e.Pool].Head(ctx, fk)
+	_, err = t.pools[e.Pool].Head(ctx, e.ID)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
 			return e, err
 		}
-		healed, hErr := t.probeAndHeal(ctx, fk)
+		healed, hErr := t.heal(ctx, e.ID)
 		if hErr != nil {
 			return e, store.ErrNotFound
 		}
-		e = healed
+		e.Pool = healed.Pool
 	}
-	touch := t.now()
-	t.mu.Lock()
-	if en, ok := t.idx[fk]; ok {
-		en.LastAccess = touch
-		if err := t.upsertEntryLocked(fk, en); err != nil {
-			log.Printf("tier: head touch %s: %v", fk, err)
-		}
-	}
-	t.mu.Unlock()
+	t.touch(fk, e.ID)
 	return e, nil
 }
 
-// DeleteObject removes the key from every pool and the index. Sweeping all
-// pools is deliberate: it also cleans leftovers of an interrupted migration.
+// DeleteObject removes the key (name layer) and releases its content
+// (refcount--; bytes swept from every pool at zero).
 func (t *TieredStore) DeleteObject(ctx context.Context, bucket, key string) error {
 	fk := fullKey(bucket, key)
 	unlock := t.lockKey(fk)
 	defer unlock()
 
-	for _, p := range t.allPools() {
-		if err := p.Delete(ctx, fk); err != nil {
-			log.Printf("tier: delete sweep %s %s: %v", p.Name(), fk, err)
-		}
-	}
 	t.mu.Lock()
+	o, ok := t.idx[fk]
+	if !ok {
+		t.mu.Unlock()
+		return nil // S3 delete is idempotent
+	}
+	id := o.ID
 	delete(t.idx, fk)
-	err := t.deleteEntryLocked(fk)
+	if err := t.delObjLocked(fk); err != nil {
+		t.mu.Unlock()
+		return err
+	}
 	t.mu.Unlock()
+
+	unlockRes := t.lockKey(id)
+	t.mu.Lock()
+	r, ok := t.res[id]
+	if !ok {
+		t.mu.Unlock()
+		unlockRes()
+		return nil
+	}
+	r.Refs--
+	if r.Refs <= 0 {
+		delete(t.res, id)
+		t.delResLocked(id)
+		t.mu.Unlock()
+		unlockRes()
+		t.sweepAll(ctx, id)
+		return nil
+	}
+	err := t.upsertResLocked(id, r)
+	t.mu.Unlock()
+	unlockRes()
 	return err
 }
 
 func (t *TieredStore) getEntry(fk string) (Entry, error) {
 	t.mu.Lock()
-	e, ok := t.idx[fk]
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+	o, ok := t.idx[fk]
 	if !ok {
 		return Entry{}, store.ErrNotFound
 	}
-	return *e, nil
+	r, ok := t.res[o.ID]
+	if !ok {
+		// Mapping without content (lost resource row): surface as missing
+		// and let reads heal or fail cleanly.
+		return Entry{}, store.ErrNotFound
+	}
+	return Entry{
+		ID:           o.ID,
+		Pool:         r.Pool,
+		Size:         r.Size,
+		ETag:         r.ETag,
+		ContentType:  o.ContentType,
+		StorageClass: o.StorageClass,
+		Metadata:     o.Metadata,
+		LastModified: o.LastModified,
+		LastAccess:   o.LastAccess,
+	}, nil
 }
 
-// probeAndHeal locates fk in a pool other than the one the index records and
-// repoints the index there. Called on a read miss after a crash interrupted
-// a migration between index update and source deletion.
-func (t *TieredStore) probeAndHeal(ctx context.Context, fk string) (Entry, error) {
+// heal locates a content id in a pool other than the one the index records
+// and repoints the resource row there. Called on a read miss after a crash
+// interrupted a migration between index update and source deletion.
+func (t *TieredStore) heal(ctx context.Context, id string) (*resRow, error) {
 	t.mu.Lock()
-	cur, ok := t.idx[fk]
+	cur, ok := t.res[id]
 	t.mu.Unlock()
 	if !ok {
-		return Entry{}, store.ErrNotFound
+		return nil, store.ErrNotFound
 	}
 	for _, p := range t.allPools() {
 		if p.Name() == cur.Pool {
 			continue
 		}
-		if _, err := p.Head(ctx, fk); err == nil {
-			e := *cur
-			e.Pool = p.Name()
+		if _, err := p.Head(ctx, id); err == nil {
+			found := *cur
+			found.Pool = p.Name()
 			t.mu.Lock()
-			t.idx[fk] = &e
-			err := t.upsertEntryLocked(fk, &e)
+			t.res[id] = &found
+			err := t.upsertResLocked(id, &found)
 			t.mu.Unlock()
-			return e, err
+			return &found, err
 		}
 	}
-	return Entry{}, store.ErrNotFound
+	return nil, store.ErrNotFound
 }
 
-// touch records a read access. Write-through to SQLite: a durable
-// LastAccess is what keeps the buffer policy correct across restarts (with
-// the old JSON index the touch was memory-only, so after a restart every
-// object was instantly "idle" and the whole buffer drained on the first
-// policy run).
-func (t *TieredStore) touch(fk string) {
+// touch records a read access on the key and bubbles the max access time
+// up to the content resource (dedup: any alias's access keeps the shared
+// bytes warm). Write-through both rows.
+func (t *TieredStore) touch(fk, id string) {
 	now := t.now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e, ok := t.idx[fk]
+	o, ok := t.idx[fk]
 	if !ok {
 		return
 	}
-	e.LastAccess = now
-	if err := t.upsertEntryLocked(fk, e); err != nil {
+	o.LastAccess = now
+	if err := t.upsertObjLocked(fk, o); err != nil {
 		log.Printf("tier: touch %s: %v", fk, err)
+	}
+	if r, ok := t.res[id]; ok && now.After(r.LastAccess) {
+		r.LastAccess = now
+		if err := t.upsertResLocked(id, r); err != nil {
+			log.Printf("tier: touch res %s: %v", shortID(id), err)
+		}
 	}
 }
 
@@ -697,8 +1000,8 @@ type ListResult struct {
 	NextToken      string // deepest key scanned; absolute "bucket/key"
 }
 
-// ListObjects pages the index. Delimiter grouping happens here because the
-// index is the merged view across tiers — individual pools cannot group.
+// ListObjects pages the name layer (the merged view across tiers — pools
+// cannot group, and names only exist here).
 func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult, error) {
 	if p.MaxKeys <= 0 {
 		p.MaxKeys = 1000
@@ -709,14 +1012,13 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 
 	t.mu.Lock()
 	keys := make([]string, 0, len(t.idx))
-	for fk, e := range t.idx {
+	for fk := range t.idx {
 		if strings.HasPrefix(fk, keyPrefix) {
-			_ = e
 			keys = append(keys, fk)
 		}
 	}
-	t.mu.Unlock()
 	sort.Strings(keys)
+	t.mu.Unlock()
 
 	emitted := 0
 	lastEmitted := "" // deepest key consumed so far (monotonic)
@@ -726,7 +1028,12 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 		if p.StartAfter != "" && fk <= p.StartAfter {
 			continue
 		}
-		rest := strings.TrimPrefix(fk, base)
+		// Prefix-stripped remainder; the emitted key keeps the prefix, the
+		// common prefix is computed against the remainder after it.
+		// Discovery background: grouping used to index the delimiter
+		// inside the prefix itself, producing "dir/dir/"-style prefixes
+		// and empty listings for subdirectories.
+		rest := strings.TrimPrefix(fk, keyPrefix)
 		cp := ""
 		// AWS groups everything after the first delimiter inside the
 		// prefix remainder into a CommonPrefix; a key exactly equal to its
@@ -737,7 +1044,7 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 			}
 		}
 		if cp != "" {
-			if cp == rest {
+			if cp == p.Prefix+rest {
 				cp = "" // the object itself is the delimiter name; list it
 			} else if cp == lastCP {
 				// Already grouped by a previous key; consume it without
@@ -759,9 +1066,10 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 			emitted++
 			continue
 		}
-		t.mu.Lock()
-		e := t.idx[fk]
-		t.mu.Unlock()
+		e, err := t.getEntry(fk)
+		if err != nil {
+			continue
+		}
 		out.Entries = append(out.Entries, store.ObjectInfo{
 			Key:          strings.TrimPrefix(fk, base),
 			Size:         e.Size,
@@ -773,16 +1081,14 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 		emitted++
 	}
 	out.IsTruncated = truncated
-	if truncated {
-		// Resume token: the deepest key scanned, even when the page ended
-		// on a grouped prefix, so the next page skips the whole group.
-		out.NextToken = lastEmitted
-	}
+	out.NextToken = lastEmitted
 	return out, nil
 }
 
-// ListBuckets returns every bucket the frontend created (or discovered in a
-// rebuild), oldest first.
+// ---------------------------------------------------------------------------
+// buckets
+
+// ListBuckets returns every bucket the frontend created, oldest first.
 func (t *TieredStore) ListBuckets(ctx context.Context) ([]store.BucketInfo, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -794,8 +1100,8 @@ func (t *TieredStore) ListBuckets(ctx context.Context) ([]store.BucketInfo, erro
 	return out, nil
 }
 
-// CreateBucket records the bucket and ensures it exists on every pool so the
-// first object write never surprises a remote backend.
+// CreateBucket records the bucket and ensures the pools can accept writes
+// (idempotent on the backends).
 func (t *TieredStore) CreateBucket(ctx context.Context, bucket string) error {
 	t.mu.Lock()
 	_, exists := t.buckets[bucket]
@@ -804,14 +1110,14 @@ func (t *TieredStore) CreateBucket(ctx context.Context, bucket string) error {
 		return store.ErrBucketExists
 	}
 	for _, p := range t.allPools() {
-		if err := p.EnsureBucket(ctx, bucket); err != nil {
+		if err := p.EnsureBucket(ctx, "data"); err != nil {
 			return err
 		}
 	}
 	t.mu.Lock()
 	created := t.now()
 	t.buckets[bucket] = created
-	err := t.upsertBucketLocked(bucket, created)
+	err := t.upBucketLocked(bucket, created)
 	t.mu.Unlock()
 	return err
 }
@@ -831,32 +1137,24 @@ func (t *TieredStore) HeadBucket(ctx context.Context, bucket string) error {
 func (t *TieredStore) DeleteBucket(ctx context.Context, bucket string) error {
 	t.mu.Lock()
 	_, ok := t.buckets[bucket]
-	t.mu.Unlock()
 	if !ok {
+		t.mu.Unlock()
 		return store.ErrNotFound
 	}
 	remaining := 0
-	t.mu.Lock()
 	for fk := range t.idx {
 		if b, _ := splitKey(fk); b == bucket {
 			remaining++
 		}
 	}
-	t.mu.Unlock()
 	if remaining > 0 {
+		t.mu.Unlock()
 		return store.ErrNotEmpty
 	}
-	t.mu.Lock()
 	delete(t.buckets, bucket)
-	err := t.deleteBucketLocked(bucket)
+	err := t.delBucketLocked(bucket)
 	t.mu.Unlock()
 	return err
-}
-
-func (t *TieredStore) allPools() []store.Store {
-	res := []store.Store{t.hot()}
-	res = append(res, t.colds()...)
-	return res
 }
 
 // Close releases every pool and the index database.
@@ -902,87 +1200,75 @@ func (t *TieredStore) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// RunOnce evaluates the tiering policy once: drains the hot pool down to the
-// idle threshold and/or the byte quota, oldest-written first. Exposed for
-// tests and manual triggering.
+// RunOnce evaluates the tiering policy once at the RESOURCE granularity:
+// drains the hot pool down to the idle threshold and/or the byte quota,
+// oldest-accessed first.
 func (t *TieredStore) RunOnce() {
 	t.mu.Lock()
 	now := t.now()
-	var hotKeys []string
+	var hotIDs []string
 	var hotBytes int64
-	for fk, e := range t.idx {
-		if e.Pool != t.cfg.Hot {
+	for id, r := range t.res {
+		if r.Pool != t.cfg.Hot {
 			continue
 		}
-		hotKeys = append(hotKeys, fk)
-		hotBytes += e.Size
+		hotIDs = append(hotIDs, id)
+		hotBytes += r.Size
 	}
-	// Idle candidates first (policy: cold is defined by staleness).
 	idle := make(map[string]bool)
-	for _, fk := range hotKeys {
-		e := t.idx[fk]
-		if t.cfg.ColdAfter > 0 && now.Sub(e.LastAccess) >= t.cfg.ColdAfter {
-			idle[fk] = true
+	for _, id := range hotIDs {
+		r := t.res[id]
+		if t.cfg.ColdAfter > 0 && now.Sub(r.LastAccess) >= t.cfg.ColdAfter {
+			idle[id] = true
 		}
 	}
-	t.mu.Unlock()
-
-	// Quota eviction: when the hot pool exceeds maxHotBytes, evict the
-	// oldest objects (by LastAccess) whether idle or not, until balanced.
 	quota := make(map[string]bool)
 	if t.cfg.MaxHotBytes > 0 {
-		t.mu.Lock()
-		sort.Slice(hotKeys, func(i, j int) bool {
-			ei, ej := t.idx[hotKeys[i]], t.idx[hotKeys[j]]
-			if ei.LastAccess.Equal(ej.LastAccess) {
-				return hotKeys[i] < hotKeys[j]
+		sort.Slice(hotIDs, func(i, j int) bool {
+			ri, rj := t.res[hotIDs[i]], t.res[hotIDs[j]]
+			if ri.LastAccess.Equal(rj.LastAccess) {
+				return hotIDs[i] < hotIDs[j]
 			}
-			return ei.LastAccess.Before(ej.LastAccess)
+			return ri.LastAccess.Before(rj.LastAccess)
 		})
-		for _, fk := range hotKeys {
+		for _, id := range hotIDs {
 			if hotBytes <= t.cfg.MaxHotBytes {
 				break
 			}
-			if idle[fk] {
+			if idle[id] {
 				continue // already scheduled via idle path
 			}
-			e := t.idx[fk]
-			hotBytes -= e.Size
-			quota[fk] = true
+			r := t.res[id]
+			hotBytes -= r.Size
+			quota[id] = true
 		}
-		t.mu.Unlock()
 	}
-
-	if len(idle) == 0 && len(quota) == 0 {
-		return
+	candidates := make([]string, 0, len(idle)+len(quota))
+	for id := range idle {
+		candidates = append(candidates, id)
 	}
-	var candidates []string
-	for fk := range idle {
-		candidates = append(candidates, fk)
+	for id := range quota {
+		candidates = append(candidates, id)
 	}
 	sort.Strings(candidates)
-	for fk := range quota {
-		candidates = append(candidates, fk)
-	}
-	sort.Strings(candidates)
+	t.mu.Unlock()
 
-	for _, fk := range candidates {
+	for _, id := range candidates {
 		target := t.nextCold()
 		if target == nil {
-			log.Printf("tier: no cold pool configured, skip %s", fk)
+			log.Printf("tier: no cold pool configured, skip %s", shortID(id))
 			return
 		}
 		from := t.hot()
-		if err := t.transfer(fk, from, target); err != nil {
-			log.Printf("tier: migrate %s %s->%s: %v", fk, from.Name(), target.Name(), err)
+		if err := t.transfer(id, from, target); err != nil {
+			log.Printf("tier: migrate %s %s->%s: %v", shortID(id), from.Name(), target.Name(), err)
 			continue
 		}
-		log.Printf("tier: moved %s %s -> %s", fk, from.Name(), target.Name())
+		log.Printf("tier: moved %s %s -> %s", shortID(id), from.Name(), target.Name())
 	}
 }
 
-// nextCold picks the drain target round-robin across all cold pools, so
-// several S3 backends share the cold load evenly.
+// nextCold picks the drain target round-robin across all cold pools.
 func (t *TieredStore) nextCold() store.Store {
 	colds := t.colds()
 	if len(colds) == 0 {
@@ -993,81 +1279,75 @@ func (t *TieredStore) nextCold() store.Store {
 	return colds[i]
 }
 
-// promote moves a cold object back to hot after it was served, impersonating
-// a cache read-through. Must NOT hold the per-key lock here: transfer()
-// takes it itself (then re-checks the index), and lockKey is not reentrant —
-// a second lock on the same key in this goroutine would deadlock forever.
-// The race is benign: a concurrent migration does what we wanted anyway.
-func (t *TieredStore) promote(ctx context.Context, fk string, _ store.ObjectInfo) {
+// promote moves a cold resource back to hot after it was served,
+// impersonating a cache read-through. Must NOT hold any key lock here:
+// transfer() takes the content-id lock itself and lockKey is not reentrant
+// (a second lock on the same id in this goroutine would deadlock forever —
+// this exact bug shipped once; see git history of promote).
+func (t *TieredStore) promote(ctx context.Context, id string) {
 	t.mu.Lock()
-	e, ok := t.idx[fk]
+	r, ok := t.res[id]
 	t.mu.Unlock()
-	if !ok || e.Pool == t.cfg.Hot {
+	if !ok || r.Pool == t.cfg.Hot {
 		return
 	}
-	from := t.pools[e.Pool]
-	if from == nil || from.Name() == t.cfg.Hot {
-		return
-	}
-	if err := t.transfer(fk, from, t.hot()); err != nil {
-		log.Printf("tier: promote %s: %v", fk, err)
+	if err := t.transfer(id, t.pools[r.Pool], t.hot()); err != nil {
+		log.Printf("tier: promote %s: %v", shortID(id), err)
 	}
 }
 
-// transfer moves an object between pools: copy (with bucket ensure on the
-// target), then flip the index, then drop the source copy. The index flip
-// happens only after the target holds a complete copy, so readers always
-// find valid bytes. A concurrent Delete/Put serializes on the key lock and
-// the re-check below prevents resurrecting a deleted key or overwriting a
-// fresh PUT with stale bytes.
-func (t *TieredStore) transfer(fk string, from, to store.Store) error {
+// transfer moves a resource between pools: copy, flip the resource row,
+// drop the source. The row flip happens only after the target holds a
+// complete copy, so readers always find valid bytes. A concurrent
+// zero-refcount release serializes on the content-id lock; the re-check
+// below prevents moving a resource that was deleted meanwhile.
+func (t *TieredStore) transfer(id string, from, to store.Store) error {
 	ctx := context.Background()
-	bucket, _ := splitKey(fk)
 
 	t.mu.Lock()
-	e, ok := t.idx[fk]
+	r, ok := t.res[id]
 	t.mu.Unlock()
-	if !ok || e.Pool != from.Name() {
-		return nil // gone or already moved; nothing to do
+	if !ok || r.Pool != from.Name() {
+		return nil // gone or already moved
 	}
 
-	if err := to.EnsureBucket(ctx, bucket); err != nil {
+	if err := to.EnsureBucket(ctx, "data"); err != nil {
 		return err
 	}
-	res, err := from.Get(ctx, fk, store.Range{Start: 0, End: -1})
+	res, err := from.Get(ctx, id, store.Range{Start: 0, End: -1})
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
-	info, err := to.Put(ctx, fk, res.Body, res.Info.Size, res.Info.ContentType, store.PutOptions{StorageClass: res.Info.StorageClass})
+	info, err := to.Put(ctx, id, res.Body, res.Info.Size, res.Info.ContentType, store.PutOptions{StorageClass: res.Info.StorageClass})
 	if err != nil {
 		return err
 	}
 
-	unlock := t.lockKey(fk)
+	unlock := t.lockKey(id)
 	defer unlock()
-	// Re-check under the key lock: a concurrent PutObject replaced the
-	// object while we copied; do NOT repoint the index or delete the fresh
-	// hot copy.
+	// Re-check under the id lock: a concurrent PutObject registered a NEW
+	// resource for the same id, or the resource was released; do not
+	// repoint the row or delete the fresh copy.
 	t.mu.Lock()
-	cur, ok := t.idx[fk]
+	cur, ok := t.res[id]
 	if !ok || cur.Pool != from.Name() {
 		t.mu.Unlock()
-		// Leave the stray copy we made at `to`; the next PutObject
-		// sweeps cold copies, so it self-heals.
+		// Leave the stray copy at `to`; the next zero-refcount sweep
+		// removes it, or a future transfer finds it via heal.
 		return nil
 	}
 	cur.Pool = to.Name()
-	cur.Size = info.Size
+	if info.Size > 0 {
+		cur.Size = info.Size
+	}
 	if info.ETag != "" {
 		cur.ETag = info.ETag
 	}
-	cur.StorageClass = info.StorageClass
-	cur.LastModified = info.LastModified
-	err = t.upsertEntryLocked(fk, cur)
+	err = t.upsertResLocked(id, cur)
 	t.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return from.Delete(ctx, fk)
+	return from.Delete(ctx, id)
 }

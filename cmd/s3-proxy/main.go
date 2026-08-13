@@ -145,6 +145,13 @@ func (c config) validate() error {
 			if p.AK == "" || p.SK == "" {
 				return fmt.Errorf("pool %q (s3) needs ak and sk", p.Name)
 			}
+			// Content-addressed resources live in one fixed namespace
+			// ("data" -> the configured bucket); per-bucket mode conflicts
+			// with global dedup (an id would need to duplicate across
+			// remotes). Require prefix mode.
+			if p.Bucket == "" {
+				return fmt.Errorf("pool %q (s3): bucket is required (prefix mode) — per-bucket mode is incompatible with content dedup", p.Name)
+			}
 		default:
 			return fmt.Errorf("pool %q: unknown backend %q (want local or s3)", p.Name, p.Backend)
 		}
@@ -212,7 +219,7 @@ func main() {
 		ScanInterval:    cfg.Tiering.ScanInterval.Duration,
 		MaxHotBytes:     cfg.Tiering.MaxHotBytes,
 		PromoteOnAccess: cfg.Tiering.PromoteOnAccess,
-	}, filepath.Join(cfg.StateDir, "objects.json"))
+	}, filepath.Join(cfg.StateDir, "tier.db"))
 	if err != nil {
 		log.Fatal(err)
 	}

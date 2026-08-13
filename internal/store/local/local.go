@@ -408,4 +408,34 @@ func (s *Store) RemoveStaleTemps(age time.Duration) error {
 	})
 }
 
+// Rename moves an object to another key within the same root. The tier
+// layer uses this to finalize content-addressed writes: bytes were streamed
+// to a temporary key while hashing, and once the sha256 is known the
+// temporary file is renamed into place without copying. Overwriting an
+// existing target (same id written twice concurrently) is safe: the content
+// is identical by construction.
+func (s *Store) Rename(ctx context.Context, fromKey, toKey string) error {
+	if !validKey(fromKey) || !validKey(toKey) {
+		return fmt.Errorf("local: rename %q -> %q: invalid key", fromKey, toKey)
+	}
+	from, to := s.objectPath(fromKey), s.objectPath(toKey)
+	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(from, to); err != nil {
+		return err
+	}
+	// Move the sidecar along. If it is missing (tmp write did not finish
+	// sidecar yet) ignore; the target keeps whatever metadata it had.
+	if _, err := os.Stat(from + metaSuffix); err == nil {
+		os.Rename(from+metaSuffix, to+metaSuffix)
+	} else {
+		// Overwrite case: drop the old sidecar, the new bytes' metadata
+		// will be written by the caller's Put path on demand.
+		os.Remove(to + metaSuffix)
+	}
+	return nil
+}
+
 var _ store.Store = (*Store)(nil)
+var _ store.Renamer = (*Store)(nil)

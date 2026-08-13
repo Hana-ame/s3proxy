@@ -379,6 +379,31 @@ func (s *Store) Buckets(ctx context.Context) ([]string, error) {
 	return res, nil
 }
 
+// Rename renames an object within the same remote bucket. S3 has no server
+// rename, so this is a CopyObject (same bucket, no data movement server-side)
+// followed by a delete of the source. Used by the tier layer to finalize
+// content-addressed writes (temporary key -> sha256 name).
+func (s *Store) Rename(ctx context.Context, fromKey, toKey string) error {
+	fromBucket, fromObj := s.splitKey(fromKey)
+	toBucket, toObj := s.splitKey(toKey)
+	if fromBucket != toBucket {
+		return fmt.Errorf("s3store: rename across buckets %q -> %q", fromKey, toKey)
+	}
+	if fromObj == "" || toObj == "" {
+		return fmt.Errorf("s3store: rename %q -> %q: missing object part", fromKey, toKey)
+	}
+	_, err := s.cli.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(toBucket),
+		Key:        aws.String(toObj),
+		CopySource: aws.String(fromBucket + "/" + fromObj),
+	})
+	if err != nil {
+		return mapErr(err)
+	}
+	_, err = s.cli.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(fromBucket), Key: aws.String(fromObj)})
+	return mapErr(err)
+}
+
 func derefStr(p *string) string {
 	if p == nil {
 		return ""
@@ -394,3 +419,4 @@ func deref(p *int64, def int64) int64 {
 }
 
 var _ store.Store = (*Store)(nil)
+var _ store.Renamer = (*Store)(nil)

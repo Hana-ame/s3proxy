@@ -123,6 +123,14 @@ type Store interface {
 	Close() error
 }
 
+// Renamer is an optional Store extension: renames an object within the
+// backend. The tier layer uses it to finalize content-addressed writes
+// (temporary key -> sha256 name) without copying bytes. Plugins without
+// Renamer fall back to copy+delete.
+type Renamer interface {
+	Rename(ctx context.Context, fromKey, toKey string) error
+}
+
 // PutOptions carries optional per-object hints.
 type PutOptions struct {
 	// StorageClass requested by the client ("" = backend default STANDARD).
@@ -228,6 +236,25 @@ func (m *MemStore) Delete(ctx context.Context, key string) error {
 	defer m.mu.Unlock()
 	delete(m.data, key)
 	delete(m.meta, key)
+	return nil
+}
+
+// Rename moves an object's bytes to another key within the store (content
+// hashing finalize step). Overwriting an existing target is allowed; the
+// bytes are identical in that case by construction.
+func (m *MemStore) Rename(ctx context.Context, fromKey, toKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.data[fromKey]
+	if !ok {
+		return ErrNotFound
+	}
+	info := m.meta[fromKey]
+	delete(m.data, fromKey)
+	delete(m.meta, fromKey)
+	info.Key = toKey
+	m.data[toKey] = data
+	m.meta[toKey] = info
 	return nil
 }
 

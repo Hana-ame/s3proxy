@@ -1,12 +1,12 @@
 package tier
 
-// Tiering policy tests: buffer drain (hot -> cold by idle time and by byte
-// quota), read-through of cold objects, optional promotion back to hot,
-// index healing after a crashed migration, and stale-copy cleanup on
-// overwrite. These pin the "one pool is another pool's buffer" behavior.
+// Tier engine tests over mem pools. Discovery backgrounds are documented
+// per test; see tier.go for the two-layer (name + content) design.
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"strings"
 	"sync"
@@ -16,13 +16,8 @@ import (
 	"s3proxy/internal/store"
 )
 
-const (
-	testAK = "ak"
-	testSK = "sk"
-)
-
-// clock is an injectable time source so tests can age objects without
-// sleeping.
+// clock is a test time source; injected via SetNow so idle/quota policy
+// decisions are deterministic.
 type clock struct {
 	mu sync.Mutex
 	t  time.Time
@@ -40,23 +35,25 @@ func (c *clock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
+// newTestTier builds hot+cold mem pools and a New() tier whose time is
+// pinned by the returned clock. statePath is per-test (fresh DB).
 func newTestTier(t *testing.T, cfg Config) (*TieredStore, *store.MemStore, *store.MemStore, *clock) {
 	t.Helper()
 	clk := &clock{t: time.Now()}
 	hot := store.NewMem("hot")
 	cold := store.NewMem("cold")
-	tier, err := New([]store.Store{hot, cold}, cfg, t.TempDir()+"/objects.json")
+	tier, err := New([]store.Store{hot, cold}, cfg, t.TempDir()+"/tier.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tier.now = clk.now
+	tier.SetNow(clk.now)
 	t.Cleanup(func() { tier.Close() })
 	return tier, hot, cold, clk
 }
 
 func put(t *testing.T, tier *TieredStore, bucket, key, body string) Entry {
 	t.Helper()
-	e, err := tier.PutObject(context.Background(), bucket, key, strings.NewReader(body), int64(len(body)), PutOpts{ContentType: "text/plain"})
+	e, err := tier.PutObject(context.Background(), bucket, key, strings.NewReader(body), int64(len(body)), PutOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,109 +74,191 @@ func getBody(t *testing.T, tier *TieredStore, bucket, key string) string {
 	return string(b)
 }
 
+func mustNotExist(t *testing.T, tier *TieredStore, bucket, key string) {
+	t.Helper()
+	if _, err := tier.HeadObject(context.Background(), bucket, key); err != store.ErrNotFound {
+		t.Fatalf("expected %s/%s to be gone, got %v", bucket, key, err)
+	}
+}
+
 func TestWritesLandInHot(t *testing.T) {
-	tier, hot, cold, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
-	put(t, tier, "bkt", "k.txt", "hello")
-	if _, err := hot.Head(context.Background(), "bkt/k.txt"); err != nil {
-		t.Fatal("object not in hot pool")
+	// The buffer contract: every write ends up in the hot pool and the
+	// resource row records it.
+	tier, hot, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e := put(t, tier, "bkt", "a", "hello")
+	if e.Pool != "hot" {
+		t.Fatalf("write landed in %q", e.Pool)
 	}
-	if _, err := cold.Head(context.Background(), "bkt/k.txt"); err == nil {
-		t.Fatal("object leaked into cold pool")
+	if _, err := hot.Head(context.Background(), e.ID); err != nil {
+		t.Fatalf("bytes absent from hot pool at id %s", e.ID)
 	}
-	if got := getBody(t, tier, "bkt", "k.txt"); got != "hello" {
-		t.Fatalf("read back %q", got)
+	tier.mu.Lock()
+	r := tier.res[e.ID]
+	tier.mu.Unlock()
+	if r == nil || r.Refs != 1 {
+		t.Fatalf("resource refs = %+v", r)
+	}
+}
+
+func TestDedupSharesContent(t *testing.T) {
+	// Discovery background: the whole point of the two-layer design —
+	// identical bytes uploaded under different keys must share one
+	// resource in the pool. Draft implementation created one xref row per
+	// key and leaked bytes; refcount semantics fix it.
+	tier, hot, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e1 := put(t, tier, "bkt", "a", "same")
+	e2 := put(t, tier, "bkt", "b", "same")
+	if e1.ID != e2.ID {
+		t.Fatalf("same content produced different ids %s vs %s", e1.ID, e2.ID)
+	}
+	// One copy on disk, two references.
+	if _, err := hot.Get(context.Background(), e1.ID, store.Range{Start: 0, End: -1}); err != nil {
+		t.Fatal(err)
+	}
+	tier.mu.Lock()
+	r := tier.res[e1.ID]
+	tier.mu.Unlock()
+	if r.Refs != 2 {
+		t.Fatalf("refs = %d, want 2", r.Refs)
+	}
+	// Deleting one key keeps the bytes alive for the other.
+	if err := tier.DeleteObject(context.Background(), "bkt", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if getBody(t, tier, "bkt", "b") != "same" {
+		t.Fatal("shared content lost after deleting one alias")
+	}
+	if err := tier.DeleteObject(context.Background(), "bkt", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hot.Head(context.Background(), e1.ID); err != store.ErrNotFound {
+		t.Fatal("bytes not swept at refcount zero")
+	}
+}
+
+func TestOverwriteReleasesOldContent(t *testing.T) {
+	// PUT over an existing key: the old content's refcount returns to
+	// zero (single reference) and its bytes disappear from the pool.
+	tier, hot, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e1 := put(t, tier, "bkt", "k", "old-data")
+	put(t, tier, "bkt", "k", "new-data")
+	if _, err := hot.Head(context.Background(), e1.ID); err != store.ErrNotFound {
+		t.Fatal("old content still present after overwrite")
+	}
+	if getBody(t, tier, "bkt", "k") != "new-data" {
+		t.Fatal("overwrite reads stale bytes")
+	}
+}
+
+func TestCopyIsZeroByte(t *testing.T) {
+	// CopyObject = mapping insert: the destination references the source
+	// content id; nothing was copied in the pool, refs went 1 -> 2.
+	tier, _, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	src := put(t, tier, "bkt", "src", "copy-me")
+	dst, err := tier.CopyObject(context.Background(), "bkt", "dst", "bkt", "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst.ID != src.ID {
+		t.Fatalf("copy diverged content: %s vs %s", dst.ID, src.ID)
+	}
+	tier.mu.Lock()
+	r := tier.res[src.ID]
+	tier.mu.Unlock()
+	if r.Refs != 2 {
+		t.Fatalf("refs = %d, want 2", r.Refs)
+	}
+	// Delete source; destination still serves.
+	if err := tier.DeleteObject(context.Background(), "bkt", "src"); err != nil {
+		t.Fatal(err)
+	}
+	if getBody(t, tier, "bkt", "dst") != "copy-me" {
+		t.Fatal("copied content lost after source delete")
 	}
 }
 
 func TestColdMigrationDrainsHot(t *testing.T) {
-	// Discovery background: the whole point of the buffer policy —
-	// uploaded objects must stop consuming the hot pool once idle.
 	// Timeline: write both at T0, touch "fresh" at T0+1.5h, run at
 	// T0+2.5h. cold.txt is idle 2.5h (>= 2h coldAfter) and must drain;
 	// fresh.txt is idle 1h (< coldAfter) and must stay in the buffer.
 	tier, hot, cold, clk := newTestTier(t, Config{
 		Hot: "hot", Cold: []string{"cold"}, ColdAfter: 2 * time.Hour,
 	})
-	put(t, tier, "bkt", "cold.txt", "idle-data")
-	put(t, tier, "bkt", "fresh.txt", "just-wrote")
+	e1 := put(t, tier, "bkt", "cold.txt", "idle-data")
+	e2 := put(t, tier, "bkt", "fresh.txt", "just-wrote")
 	clk.advance(90 * time.Minute)
 	tier.GetObject(context.Background(), "bkt", "fresh.txt", store.Range{}) // touch: keep fresh
 	clk.advance(time.Hour)
 	tier.RunOnce()
 
-	if _, err := cold.Head(context.Background(), "bkt/cold.txt"); err != nil {
-		t.Fatal("idle object not migrated to cold")
+	if _, err := hot.Head(context.Background(), e1.ID); err == nil {
+		t.Fatal("idle resource not drained")
 	}
-	if _, err := hot.Head(context.Background(), "bkt/cold.txt"); err == nil {
-		t.Fatal("idle object still in hot after drain")
+	if _, err := cold.Head(context.Background(), e1.ID); err != nil {
+		t.Fatal("drained resource missing in cold pool")
 	}
-	if _, err := hot.Head(context.Background(), "bkt/fresh.txt"); err != nil {
-		t.Fatal("recently-touched object must stay hot")
-	}
-	if got := getBody(t, tier, "bkt", "cold.txt"); got != "idle-data" {
-		t.Fatalf("cold read-back %q", got)
+	if _, err := hot.Head(context.Background(), e2.ID); err != nil {
+		t.Fatal("recently-touched resource must stay hot")
 	}
 }
 
 func TestQuotaEviction(t *testing.T) {
-	// maxHotBytes caps the buffer: the oldest objects are evicted even if
-	// they were touched recently.
+	// maxHotBytes caps the buffer: the oldest resources are evicted even
+	// if they were touched recently, until the quota is met.
 	tier, hot, _, clk := newTestTier(t, Config{
 		Hot: "hot", Cold: []string{"cold"}, MaxHotBytes: 5,
 	})
-	put(t, tier, "bkt", "a", "a") // 1 byte
+	e1 := put(t, tier, "bkt", "a", "a") // 1 byte
 	clk.advance(time.Minute)
-	put(t, tier, "bkt", "b", "bb") // 2 bytes
+	e2 := put(t, tier, "bkt", "b", "bb") // 2 bytes
 	clk.advance(time.Minute)
-	put(t, tier, "bkt", "c", "ccc") // 3 bytes; hot now 6 > 5
+	e3 := put(t, tier, "bkt", "c", "ccc") // 3 bytes; hot now 6 > 5
 
 	tier.RunOnce()
-	if _, err := hot.Head(context.Background(), "bkt/a"); err == nil {
-		t.Fatal("oldest object not evicted over quota")
+	if _, err := hot.Head(context.Background(), e1.ID); err == nil {
+		t.Fatal("oldest resource not evicted over quota")
 	}
-	if _, err := hot.Head(context.Background(), "bkt/b"); err != nil {
+	if _, err := hot.Head(context.Background(), e2.ID); err != nil {
 		t.Fatal("second oldest evicted while quota allowed keeping it")
 	}
-	if _, err := hot.Head(context.Background(), "bkt/c"); err != nil {
-		t.Fatal("newest object evicted")
+	if _, err := hot.Head(context.Background(), e3.ID); err != nil {
+		t.Fatal("newest resource evicted")
 	}
 }
 
 func TestReadThroughHealsIndex(t *testing.T) {
-	// Simulate a crash between index update and source deletion: index
-	// says hot, bytes live only in cold. A read must find the object and
-	// repoint the index (this is what makes durability after restarts
-	// work at all).
+	// A crashed migration can leave the index pointing at a pool where
+	// the bytes no longer exist. A read must probe other pools and repoint
+	// the resource row (heal) instead of failing.
 	tier, hot, cold, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
-	put(t, tier, "bkt", "k", "moved-away")
-	// Manually move bytes cold-ward without touching the index.
-	if _, err := cold.Put(context.Background(), "bkt/k", strings.NewReader("moved-away"), 10, "", store.PutOptions{}); err != nil {
+	e := put(t, tier, "bkt", "k", "data")
+	// Simulate: transfer happened, index says hot, but bytes only in cold.
+	if err := hot.Delete(context.Background(), e.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := hot.Delete(context.Background(), "bkt/k"); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := getBody(t, tier, "bkt", "k"); got != "moved-away" {
-		t.Fatalf("read-through get: %q", got)
+	cold.Put(context.Background(), e.ID, strings.NewReader("data"), 4, "", store.PutOptions{})
+	if got := getBody(t, tier, "bkt", "k"); got != "data" {
+		t.Fatalf("healed read: %q", got)
 	}
 	tier.mu.Lock()
-	e := tier.idx["bkt/k"]
+	pool := tier.res[e.ID].Pool
 	tier.mu.Unlock()
-	if e == nil || e.Pool != "cold" {
-		t.Fatalf("index not healed to cold: %+v", e)
+	if pool != "cold" {
+		t.Fatalf("index not healed to cold, pool=%q", pool)
 	}
 }
 
 func TestPromoteOnAccess(t *testing.T) {
+	// Read of a cold resource triggers async promotion back to hot; the
+	// first read still serves from cold while the copy races.
 	tier, hot, cold, clk := newTestTier(t, Config{
 		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour, PromoteOnAccess: true,
 	})
-	put(t, tier, "bkt", "k", "data")
+	e := put(t, tier, "bkt", "k", "data")
 	clk.advance(2 * time.Hour)
 	tier.RunOnce()
-	if _, err := cold.Head(context.Background(), "bkt/k"); err != nil {
-		t.Fatal("object should be cold now")
+	if _, err := cold.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("resource should be cold now")
 	}
 
 	if got := getBody(t, tier, "bkt", "k"); got != "data" {
@@ -188,60 +267,42 @@ func TestPromoteOnAccess(t *testing.T) {
 	// Promotion runs asynchronously; wait for it.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, err := hot.Head(context.Background(), "bkt/k")
+		_, err := hot.Head(context.Background(), e.ID)
 		if err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("cold object not promoted back to hot")
+			t.Fatal("cold resource not promoted back to hot")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func TestOverwriteRemovesColdCopy(t *testing.T) {
-	// A newer PUT must eliminate the stale cold copy, otherwise reads
-	// after a subsequent migration could serve the old bytes.
-	tier, hot, cold, clk := newTestTier(t, Config{
-		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour,
-	})
-	put(t, tier, "bkt", "k", "v1")
-	clk.advance(2 * time.Hour)
-	tier.RunOnce()
-	if _, err := cold.Head(context.Background(), "bkt/k"); err != nil {
-		t.Fatal("setup: object should be cold")
-	}
-
-	put(t, tier, "bkt", "k", "v2-new")
-	if _, err := hot.Head(context.Background(), "bkt/k"); err != nil {
-		t.Fatal("overwrite should be in hot")
-	}
-	if _, err := cold.Head(context.Background(), "bkt/k"); err == nil {
-		t.Fatal("stale cold copy survived the overwrite")
-	}
-	if got := getBody(t, tier, "bkt", "k"); got != "v2-new" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestDeleteSweepsTiers(t *testing.T) {
-	tier, _, cold, clk := newTestTier(t, Config{
-		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour,
+	// Delete removes the resource bytes from every pool (covered copies
+	// included), then the key.
+	tier, hot, cold, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour, PromoteOnAccess: true,
 	})
-	put(t, tier, "bkt", "k", "data")
+	e := put(t, tier, "bkt", "k", "data")
 	clk.advance(2 * time.Hour)
 	tier.RunOnce()
-	if _, err := cold.Head(context.Background(), "bkt/k"); err != nil {
-		t.Fatal("setup: object should be cold")
+	if _, err := cold.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("setup: resource should be cold")
 	}
 	if err := tier.DeleteObject(context.Background(), "bkt", "k"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cold.Head(context.Background(), "bkt/k"); err == nil {
+	if _, err := cold.Head(context.Background(), e.ID); err == nil {
 		t.Fatal("cold copy not swept by delete")
 	}
-	if _, _, err := tier.GetObject(context.Background(), "bkt", "k", store.Range{}); err != store.ErrNotFound {
-		t.Fatalf("get after delete: %v", err)
+	if _, err := hot.Head(context.Background(), e.ID); err == nil {
+		t.Fatal("hot leftover after delete")
+	}
+	mustNotExist(t, tier, "bkt", "k")
+	// Delete of a gone key is idempotent (S3 semantics).
+	if err := tier.DeleteObject(context.Background(), "bkt", "k"); err != nil {
+		t.Fatalf("idempotent delete: %v", err)
 	}
 }
 
@@ -251,6 +312,7 @@ func TestListAcrossTiersWithDelimiter(t *testing.T) {
 	})
 	put(t, tier, "bkt", "a.txt", "1")
 	put(t, tier, "bkt", "dir/b.txt", "2")
+	put(t, tier, "bkt", "dir/sub/c.txt", "3")
 	clk.advance(2 * time.Hour)
 	tier.RunOnce()
 
@@ -259,82 +321,135 @@ func TestListAcrossTiersWithDelimiter(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(res.Entries) != 1 || res.Entries[0].Key != "a.txt" {
-		t.Fatalf("entries: %+v", res.Entries)
+		t.Fatalf("delimiter contents: %+v", res.Entries)
 	}
 	if len(res.CommonPrefixes) != 1 || res.CommonPrefixes[0] != "dir/" {
-		t.Fatalf("common prefixes: %v", res.CommonPrefixes)
+		t.Fatalf("delimiter prefixes: %+v", res.CommonPrefixes)
 	}
 
-	res, err = tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Prefix: "dir/"})
+	res, err = tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Prefix: "dir/", Delimiter: "/"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(res.Entries) != 1 || res.Entries[0].Key != "dir/b.txt" {
-		t.Fatalf("prefix list: %+v", res.Entries)
+		t.Fatalf("subdir contents: %+v", res.Entries)
+	}
+	if len(res.CommonPrefixes) != 1 || res.CommonPrefixes[0] != "dir/sub/" {
+		t.Fatalf("subdir prefixes: %+v", res.CommonPrefixes)
 	}
 }
 
 func TestListPaginationToken(t *testing.T) {
+	// The page token must advance past exactly the keys a page emitted:
+	// a boundary hit on a key that was NOT returned must not skip it.
+	// Discovery background: NextToken was once assigned before the
+	// truncation check, so page2 skipped the first key of page1's next
+	// page.
 	tier, _, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
-	put(t, tier, "bkt", "a", "1")
-	put(t, tier, "bkt", "b", "2")
-	put(t, tier, "bkt", "c", "3")
-
-	page1, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", MaxKeys: 2})
+	for _, k := range []string{"a", "b", "c"} {
+		put(t, tier, "bkt", k, k)
+	}
+	res1, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", MaxKeys: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !page1.IsTruncated || len(page1.Entries) != 2 {
-		t.Fatalf("page1: %+v", page1)
+	if !res1.IsTruncated {
+		t.Fatalf("page1 not truncated: %+v", res1)
 	}
-	page2, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", MaxKeys: 2, StartAfter: page1.NextToken})
+	res2, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", MaxKeys: 2, StartAfter: res1.NextToken})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page2.Entries) != 1 || page2.Entries[0].Key != "c" {
-		t.Fatalf("page2: %+v", page2.Entries)
+	if len(res2.Entries) != 1 || res2.Entries[0].Key != "c" {
+		t.Fatalf("page2: %+v (token %q)", res2.Entries, res1.NextToken)
+	}
+	if res2.IsTruncated {
+		t.Fatalf("page2 truncated: %+v", res2)
 	}
 }
 
-func TestRebuildFromPools(t *testing.T) {
-	// Discovery background: index is the metadata source of truth; after a
-	// crash or manual state deletion the index must be reproducible from
-	// the pools alone, and duplicates (both copies present after an
-	// interrupted migration) must collapse to one entry.
+func TestRebuildRestoresContentLayer(t *testing.T) {
+	// A lost DB cannot restore names (documented limitation), but the
+	// content layer comes back from pool listings, and a future upload of
+	// the same bytes dedups into the recovered resource instead of
+	// duplicating.
 	clk := &clock{t: time.Now()}
 	hot := store.NewMem("hot")
 	cold := store.NewMem("cold")
 	ctx := context.Background()
-	hot.EnsureBucket(ctx, "bkt")
-	cold.EnsureBucket(ctx, "bkt")
-	// Object present in BOTH pools (crash refl); cold copy is newer.
-	hot.Put(ctx, "bkt/dup", strings.NewReader("dup"), 3, "", store.PutOptions{})
-	if _, err := cold.Put(ctx, "bkt/dup", strings.NewReader("dup2"), 4, "", store.PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	// Object only in cold (post-migration crash).
-	cold.Put(ctx, "bkt/only-cold", strings.NewReader("x"), 1, "", store.PutOptions{})
-	// Object only in hot.
-	hot.Put(ctx, "bkt/only-hot", strings.NewReader("y"), 1, "", store.PutOptions{})
+	// Pool keys are content ids; seed with the REAL sha256 of the bytes so
+	// the dedup probe below can hit them.
+	h := sha256.Sum256([]byte("dup2"))
+	dupID := hex.EncodeToString(h[:])
+	hot.Put(ctx, dupID, strings.NewReader("dup2"), 4, "", store.PutOptions{})
+	hot.Put(ctx, "tmp/deadbeef", strings.NewReader("stray"), 5, "", store.PutOptions{})
+	cold.Put(ctx, "only-cold-id", strings.NewReader("x"), 1, "", store.PutOptions{})
 
-	tier, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, t.TempDir()+"/objects.json")
+	tier, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, t.TempDir()+"/tier.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tier.Close()
-	tier.now = clk.now
+	tier.SetNow(clk.now)
 
-	res, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt"})
+	tier.mu.Lock()
+	ids := make(map[string]*resRow)
+	for id, r := range tier.res {
+		ids[id] = r
+	}
+	tier.mu.Unlock()
+	if _, ok := ids["tmp/deadbeef"]; ok {
+		t.Fatal("stray temp key recovered as a resource")
+	}
+	for want, pool := range map[string]string{dupID: "hot", "only-cold-id": "cold"} {
+		r, ok := ids[want]
+		if !ok {
+			t.Fatalf("resource %s missing after rebuild", want)
+		}
+		if r.Pool != pool {
+			t.Fatalf("resource %s in pool %q, want %q", want, r.Pool, pool)
+		}
+	}
+
+	// Same bytes uploaded again dedup into the recovered resource.
+	e := put(t, tier, "bkt", "k", "dup2")
+	if e.ID != dupID {
+		t.Fatalf("dedup missed rebuilt content: id %s", e.ID)
+	}
+	tier.mu.Lock()
+	got := tier.res[dupID]
+	tier.mu.Unlock()
+	if got.Refs != 1 {
+		t.Fatalf("refs after dedup into rebuilt resource: %d", got.Refs)
+	}
+}
+
+func TestDedupSurvivesRestart(t *testing.T) {
+	// The index is durable: same content across a restart still lands on
+	// one resource (refcount persisted).
+	statePath := t.TempDir() + "/tier.db"
+	hot := store.NewMem("hot")
+	cold := store.NewMem("cold")
+	t1, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Entries) != 3 {
-		t.Fatalf("expected 3 entries after rebuild, got %+v", res.Entries)
+	e1 := put(t, t1, "bkt", "a", "x")
+	t1.Close()
+
+	t2, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}}, statePath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The duplicate must resolve to the newer (cold) copy.
-	res, _ = tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Prefix: "dup"})
-	if got := getBody(t, tier, "bkt", "dup"); got != "dup2" {
-		t.Fatalf("dup resolved to %q", got)
+	defer t2.Close()
+	e2 := put(t, t2, "bkt", "b", "x")
+	if e1.ID != e2.ID {
+		t.Fatalf("ids diverged across restart: %s vs %s", e1.ID, e2.ID)
 	}
-	_ = res
+	t2.mu.Lock()
+	refs := t2.res[e2.ID].Refs
+	t2.mu.Unlock()
+	if refs != 2 {
+		t.Fatalf("refs after restart = %d, want 2", refs)
+	}
 }

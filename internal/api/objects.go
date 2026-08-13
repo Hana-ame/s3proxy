@@ -354,10 +354,11 @@ func userMetadata(r *http.Request) map[string]string {
 	return meta
 }
 
-// handleCopyObject implements PUT with x-amz-copy-source. The source is
-// streamed through the tier (which may promote it from a cold pool), then
-// written back through the hot pool: this keeps copies correct across any
-// tier combination without server-side-copy support in the plugins.
+// handleCopyObject implements PUT with x-amz-copy-source. With the
+// content-addressed tier this is a mapping insert: the destination key
+// references the source's content id, so NO bytes are copied at all. The
+// tier fallback (stream through hot) is unnecessary; CopyObject is the
+// zero-copy path by construction.
 func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, requestID, bucket, key string) {
 	src := r.Header.Get("x-amz-copy-source")
 	srcBucket, srcKey, ok := parseCopySource(src)
@@ -367,10 +368,11 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, reques
 	}
 	if srcBucket == bucket && srcKey == key {
 		// S3 replaces the object with itself; rclone's copy of an object
-		// onto itself hits this path. We re-stream anyway (harmless).
+		// onto itself hits this path. The mapping insert below is
+		// idempotent in refcount terms: same content id, no double count.
 	}
 
-	e, err := s.tier.HeadObject(r.Context(), srcBucket, srcKey)
+	e, err := s.tier.CopyObject(r.Context(), bucket, key, srcBucket, srcKey)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, r, errNotFoundKey(srcBucket, srcKey), requestID)
@@ -379,24 +381,6 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, reques
 		writeError(w, r, fmtErr("%v", err), requestID)
 		return
 	}
-	res, _, err := s.tier.GetObject(r.Context(), srcBucket, srcKey, store.Range{Start: 0, End: -1})
-	if err != nil {
-		writeError(w, r, fmtErr("%v", err), requestID)
-		return
-	}
-	defer res.Body.Close()
-	put, err := s.tier.PutObject(r.Context(), bucket, key, res.Body, res.Info.Size, tier.PutOpts{
-		ContentType:  e.ContentType,
-		Metadata:     e.Metadata,
-		StorageClass: r.Header.Get("x-amz-storage-class"),
-	})
-	if err != nil {
-		writeError(w, r, fmtErr("%v", err), requestID)
-		return
-	}
-	if put.ContentType == "" {
-		put.ContentType = e.ContentType
-	}
 	var copyRes struct {
 		XMLName      xml.Name `xml:"CopyObjectResult"`
 		Xmlns        string   `xml:"xmlns,attr"`
@@ -404,8 +388,8 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, reques
 		LastModified string   `xml:"LastModified"`
 	}
 	copyRes.Xmlns = s3Namespace
-	copyRes.ETag = put.ETag
-	copyRes.LastModified = put.LastModified.UTC().Format(time.RFC3339)
+	copyRes.ETag = e.ETag
+	copyRes.LastModified = e.LastModified.UTC().Format(time.RFC3339)
 	writeXML(w, http.StatusOK, requestID, copyRes)
 }
 
