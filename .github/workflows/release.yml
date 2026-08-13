@@ -1,0 +1,77 @@
+# Release: build both binaries for the common platforms and attach them to
+# a GitHub Release. Triggered by tags like v1.0.0.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+          - os: darwin
+            arch: arm64
+            ext: ""
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/s3-proxy-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}" ./cmd/s3-proxy
+          go build -trimpath -ldflags "-s -w" -o "dist/s3-store-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}" ./cmd/s3-store
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package
+        run: |
+          cd dist
+          for f in *; do
+            case "$f" in
+              *.exe) zip "${f%.exe}.zip" "$f" ;;
+              *)      tar czf "$f.tar.gz" "$f" ;;
+            esac
+          done
+          ls -la
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip, dist/*.tar.gz
+          generate_release_notes: true

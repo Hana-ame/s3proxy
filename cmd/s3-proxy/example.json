@@ -1,0 +1,39 @@
+{
+  "listen": "0.0.0.0:8443",
+  "tls_cert": "/etc/letsencrypt/live/s3.moonchan.xyz/fullchain.pem",
+  "tls_key": "/etc/letsencrypt/live/s3.moonchan.xyz/privkey.pem",
+  "region": "us-east-1",
+  "base_host": "s3.moonchan.xyz",
+  "state_dir": "/var/lib/s3-proxy",
+  "client_creds": [
+    { "ak": "replace-with-client-access-key", "sk": "replace-with-client-secret-key" }
+  ],
+  "pools": [
+    {
+      "name": "local-hot",
+      "backend": "local",
+      "role": "hot",
+      "path": "/var/lib/s3-proxy/hot"
+    },
+    {
+      "name": "r2-cold",
+      "backend": "s3",
+      "role": "cold",
+      "endpoint": "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+      "region": "auto",
+      "bucket": "s3proxy-archive",
+      "ak": "replace-with-r2-access-key",
+      "sk": "replace-with-r2-secret-key",
+      "insecure": false,
+      "timeout": "5m"
+    }
+  ],
+  "tiering": {
+    "hot": ["local-hot"],
+    "cold": ["r2-cold"],
+    "cold_after": "720h",
+    "scan_interval": "1h",
+    "max_hot_bytes": "0",
+    "promote_on_access": true
+  }
+}

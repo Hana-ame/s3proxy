@@ -1,0 +1,16 @@
+# Build artifacts
+/s3-proxy
+/s3-store
+*.exe
+
+# Runtime state (index db, multipart staging, hot pool content)
+/state/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.log
+.DS_Store
