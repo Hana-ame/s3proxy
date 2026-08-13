@@ -89,9 +89,9 @@ type TieredStore struct {
 
 	// Prepared statements (single writer connection, so they are safe to
 	// reuse; see New).
-	upEntry  *sql.Stmt
-	delEntry *sql.Stmt
-	upBucket *sql.Stmt
+	upEntry   *sql.Stmt
+	delEntry  *sql.Stmt
+	upBucket  *sql.Stmt
 	delBucket *sql.Stmt
 
 	keyLocks sync.Map // key -> *sync.Mutex, serializes byte moves per object
@@ -181,9 +181,9 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		return nil, fmt.Errorf("tier: init schema: %w", err)
 	}
 	for name, stmt := range map[string]**sql.Stmt{
-		"upEntry":  &t.upEntry,
-		"delEntry": &t.delEntry,
-		"upBucket": &t.upBucket,
+		"upEntry":   &t.upEntry,
+		"delEntry":  &t.delEntry,
+		"upBucket":  &t.upBucket,
 		"delBucket": &t.delBucket,
 	} {
 		*stmt, err = db.Prepare(stmtSQL(name))
