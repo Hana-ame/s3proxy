@@ -36,6 +36,22 @@
 // maps with one row write per mutation; access times are durable so a
 // restart never drains the buffer instantly (a failure of the previous
 // JSON-index design, where touch was memory-only).
+//
+// External control (no HTTP admin endpoint): a second process (see cmd/
+// s3-admin) opens the same SQLite file and writes INTO control tables. The
+// tier polls them on a fixed 1s cadence and consumes:
+//
+//   - control(k,v): runtime overrides of auto_enabled / cold_after_ms /
+//     max_hot_bytes / promote_on_access — the memory maps are authoritative
+//     for object data, so external edits MUST go through these tables or
+//     they get silently overwritten by the next upsert.
+//   - commands(seq,verb,arg): force operations (migrate / promote by key or
+//     content id) executed by the polling loop.
+//
+// Read-side queries (status, idle detection) can be done directly with any
+// SQLite client against the resources/objects tables — they are a live
+// mirror of the in-memory state; v_cold_status provides ready-made idle
+// seconds per resource.
 package tier
 
 import (
@@ -53,8 +69,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite, no cgo
@@ -115,6 +133,15 @@ type resRow struct {
 	LastAccess   time.Time // max of referencing keys' access
 }
 
+// overrides carries the runtime policy knobs set through the control table
+// by an external admin process; nil fields mean "use the Config value".
+// Swapped atomically; the polling loop publishes a new struct on change.
+type overrides struct {
+	ColdAfter       *time.Duration
+	MaxHotBytes     *int64
+	PromoteOnAccess *bool
+}
+
 // TieredStore mediates frontend operations across the configured pools.
 type TieredStore struct {
 	pools map[string]store.Store
@@ -142,6 +169,11 @@ type TieredStore struct {
 	// promote deadlock history: transfer used to be called while holding a
 	// key lock).
 	rr uint64 // round-robin cursor across cold pools
+
+	// External control state, owned by the polling loop (except autoOn
+	// which the Run loop reads and test code flips via control rows):
+	autoOn atomic.Bool // false = background migration loop is paused
+	ov     atomic.Pointer[overrides]
 }
 
 // SetNow injects a test clock. Not for production use.
@@ -184,7 +216,22 @@ CREATE TABLE IF NOT EXISTS resources (
 CREATE TABLE IF NOT EXISTS buckets (
   bucket  TEXT PRIMARY KEY,
   created TEXT NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS control (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS commands (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  verb TEXT NOT NULL,
+  arg  TEXT NOT NULL DEFAULT ''
+);
+CREATE VIEW IF NOT EXISTS v_cold_status AS
+SELECT id, pool, refs, size, etag,
+       last_modified, last_access,
+       CAST(strftime('%s','now') AS INTEGER)
+         - CAST(strftime('%s', last_access) AS INTEGER) AS idle_seconds
+FROM resources;`
 
 // New creates the tiered store. The index lives in the SQLite file at
 // statePath. If the file is missing or unreadable (corrupt), the content
@@ -212,6 +259,7 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		res:       make(map[string]*resRow),
 		buckets:   make(map[string]time.Time),
 	}
+	t.autoOn.Store(true) // auto migration starts enabled; control can pause
 	for _, p := range pools {
 		t.pools[p.Name()] = p
 	}
@@ -270,6 +318,9 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 			return nil, err
 		}
 	}
+	// Apply persisted control rows immediately: a leftover auto_enabled=0
+	// must survive a restart (e.g. maintenance window already paused).
+	t.consumeControl(context.Background())
 	return t, nil
 }
 
@@ -831,7 +882,11 @@ func (t *TieredStore) GetObject(ctx context.Context, bucket, key string, rng sto
 		}
 	}
 	t.touch(fk, e.ID)
-	if t.cfg.PromoteOnAccess && e.Pool != t.cfg.Hot {
+	promote := t.cfg.PromoteOnAccess
+	if ov := t.ov.Load(); ov != nil && ov.PromoteOnAccess != nil {
+		promote = *ov.PromoteOnAccess
+	}
+	if promote && e.Pool != t.cfg.Hot {
 		go t.promote(ctx, e.ID)
 	}
 	return res, e, nil
@@ -1188,22 +1243,220 @@ func (t *TieredStore) Run(ctx context.Context, interval time.Duration) {
 			}
 		}()
 	}
+	// Poller runs on its own goroutine — it is an endless loop and must
+	// not block the migration loop below (a synchronous call here froze
+	// RunOnce forever, caught by the auto-pause test).
+	go t.pollControl(ctx)
 	ticks := time.NewTicker(interval)
 	defer ticks.Stop()
+	// Log the pause state once per transition, not every tick.
+	pausedLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks.C:
+			if !t.autoOn.Load() {
+				if !pausedLogged {
+					log.Printf("tier: auto migration paused by control (auto_enabled=0)")
+					pausedLogged = true
+				}
+				continue
+			}
+			pausedLogged = false
 			t.RunOnce()
 		}
 	}
 }
 
+// pollControl runs the external-control consumer on a fixed cadence: read
+// the control table (policy overrides + pause flag) and drain the commands
+// queue. The 1s cadence is what makes "write the DB from another process"
+// work as remote control; a single tiny SELECT per second on the
+// single-connection DB is negligible.
+func (t *TieredStore) pollControl(ctx context.Context) {
+	ticker := time.NewTicker(controlPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.consumeControl(ctx)
+			t.consumeCommands(ctx)
+		}
+	}
+}
+
+// controlPollInterval is the latency budget for external admin actions.
+const controlPollInterval = time.Second
+
+// consumeControl applies the control table to the running policy. The
+// full table is re-read and a fresh overrides struct is published on every
+// poll: DELETing a control row therefore reverts that knob to the config
+// value immediately (fresh struct = nil fields = use Config).
+func (t *TieredStore) consumeControl(ctx context.Context) {
+	rows, err := t.db.QueryContext(ctx, `SELECT k, v FROM control`)
+	if err != nil {
+		log.Printf("tier: control read: %v", err)
+		return
+	}
+	defer rows.Close()
+	ov := &overrides{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			log.Printf("tier: control read: %v", err)
+			return
+		}
+		switch k {
+		case "auto_enabled":
+			t.autoOn.Store(v == "1")
+		case "cold_after_ms":
+			if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
+				d := time.Duration(ms) * time.Millisecond
+				ov.ColdAfter = &d
+			} else {
+				log.Printf("tier: control cold_after_ms=%q: %v", v, err)
+			}
+		case "max_hot_bytes":
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				ov.MaxHotBytes = &n
+			} else {
+				log.Printf("tier: control max_hot_bytes=%q: %v", v, err)
+			}
+		case "promote_on_access":
+			b := v == "1"
+			ov.PromoteOnAccess = &b
+		default:
+			log.Printf("tier: control: unknown key %q (ignored)", k)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("tier: control read: %v", err)
+		return
+	}
+	t.ov.Store(ov)
+}
+
+// consumeCommands drains the commands queue, executing each verb exactly
+// once. Commands are deleted after execution (success or failure — the log
+// preserves the outcome; a failed command is not retried to avoid hanging
+// the queue on a persistent error).
+func (t *TieredStore) consumeCommands(ctx context.Context) {
+	rows, err := t.db.QueryContext(ctx, `SELECT seq, verb, arg FROM commands ORDER BY seq`)
+	if err != nil {
+		log.Printf("tier: commands read: %v", err)
+		return
+	}
+	var cmds []struct {
+		seq  int64
+		verb string
+		arg  string
+	}
+	for rows.Next() {
+		var c struct {
+			seq  int64
+			verb string
+			arg  string
+		}
+		if err := rows.Scan(&c.seq, &c.verb, &c.arg); err != nil {
+			rows.Close()
+			log.Printf("tier: commands read: %v", err)
+			return
+		}
+		cmds = append(cmds, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("tier: commands read: %v", err)
+		return
+	}
+	for _, c := range cmds {
+		if err := t.execCommand(ctx, c.verb, c.arg); err != nil {
+			log.Printf("tier: command %d (%s %q): %v", c.seq, c.verb, c.arg, err)
+		}
+		if _, err := t.db.ExecContext(ctx, `DELETE FROM commands WHERE seq = ?`, c.seq); err != nil {
+			log.Printf("tier: cleanup command %d: %v", c.seq, err)
+		}
+	}
+}
+
+// execCommand runs one admin verb. arg is either "bucket/key" (name layer)
+// or a bare content id (64 hex chars).
+func (t *TieredStore) execCommand(ctx context.Context, verb, arg string) error {
+	id, err := t.resolveCommandID(arg)
+	if err != nil {
+		return err
+	}
+	switch verb {
+	case "migrate":
+		t.mu.Lock()
+		r, ok := t.res[id]
+		t.mu.Unlock()
+		if !ok {
+			return store.ErrNotFound
+		}
+		if r.Pool != t.cfg.Hot {
+			return fmt.Errorf("resource already in cold pool %q", r.Pool)
+		}
+		target := t.nextCold()
+		if target == nil {
+			return fmt.Errorf("no cold pool configured")
+		}
+		// transfer re-checks placement under the content lock, so a
+		// concurrent auto-move yields a clean error instead of corruption.
+		return t.transfer(id, t.hot(), target)
+	case "promote":
+		t.mu.Lock()
+		r, ok := t.res[id]
+		t.mu.Unlock()
+		if !ok {
+			return store.ErrNotFound
+		}
+		if r.Pool == t.cfg.Hot {
+			return fmt.Errorf("resource already in hot pool")
+		}
+		from, ok := t.pools[r.Pool]
+		if !ok {
+			return fmt.Errorf("pool %q no longer configured", r.Pool)
+		}
+		return t.transfer(id, from, t.hot())
+	default:
+		return fmt.Errorf("unknown verb %q", verb)
+	}
+}
+
+// resolveCommandID accepts "bucket/key" (looked up in the name layer) or a
+// bare content id (trusted as-is; wrong ids fail later in transfer).
+func (t *TieredStore) resolveCommandID(arg string) (string, error) {
+	if strings.Contains(arg, "/") {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if o, ok := t.idx[arg]; ok {
+			return o.ID, nil
+		}
+		return "", fmt.Errorf("key %q not found", arg)
+	}
+	return arg, nil
+}
+
 // RunOnce evaluates the tiering policy once at the RESOURCE granularity:
 // drains the hot pool down to the idle threshold and/or the byte quota,
-// oldest-accessed first.
+// oldest-accessed first. Policy knobs come from the control overrides when
+// present, else from Config (control rows are deleted to revert).
 func (t *TieredStore) RunOnce() {
+	ov := t.ov.Load()
+	coldAfter := t.cfg.ColdAfter
+	maxHot := t.cfg.MaxHotBytes
+	if ov != nil {
+		if ov.ColdAfter != nil {
+			coldAfter = *ov.ColdAfter
+		}
+		if ov.MaxHotBytes != nil {
+			maxHot = *ov.MaxHotBytes
+		}
+	}
 	t.mu.Lock()
 	now := t.now()
 	var hotIDs []string
@@ -1218,12 +1471,12 @@ func (t *TieredStore) RunOnce() {
 	idle := make(map[string]bool)
 	for _, id := range hotIDs {
 		r := t.res[id]
-		if t.cfg.ColdAfter > 0 && now.Sub(r.LastAccess) >= t.cfg.ColdAfter {
+		if coldAfter > 0 && now.Sub(r.LastAccess) >= coldAfter {
 			idle[id] = true
 		}
 	}
 	quota := make(map[string]bool)
-	if t.cfg.MaxHotBytes > 0 {
+	if maxHot > 0 {
 		sort.Slice(hotIDs, func(i, j int) bool {
 			ri, rj := t.res[hotIDs[i]], t.res[hotIDs[j]]
 			if ri.LastAccess.Equal(rj.LastAccess) {
@@ -1232,7 +1485,7 @@ func (t *TieredStore) RunOnce() {
 			return ri.LastAccess.Before(rj.LastAccess)
 		})
 		for _, id := range hotIDs {
-			if hotBytes <= t.cfg.MaxHotBytes {
+			if hotBytes <= maxHot {
 				break
 			}
 			if idle[id] {

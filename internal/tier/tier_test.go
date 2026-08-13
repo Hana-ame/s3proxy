@@ -453,3 +453,183 @@ func TestDedupSurvivesRestart(t *testing.T) {
 		t.Fatalf("refs after restart = %d, want 2", refs)
 	}
 }
+
+// setControl writes one control row directly into the DB, the same way an
+// external admin process would (cmd/s3-admin / raw sqlite3).
+func setControl(t *testing.T, tier *TieredStore, k, v string) {
+	t.Helper()
+	if _, err := tier.db.Exec(`INSERT INTO control (k, v) VALUES (?, ?)
+		ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func clearControl(t *testing.T, tier *TieredStore, k string) {
+	t.Helper()
+	if _, err := tier.db.Exec(`DELETE FROM control WHERE k = ?`, k); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func queueCommand(t *testing.T, tier *TieredStore, verb, arg string) {
+	t.Helper()
+	if _, err := tier.db.Exec(`INSERT INTO commands (verb, arg) VALUES (?, ?)`, verb, arg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestControlAutoPause(t *testing.T) {
+	// The Run loop gates RunOnce on the auto_enabled flag; the poll loop
+	// publishes it. Run the real loops with a fast tick to prove pause
+	// holds back migration and resume lets it through.
+	tier, hot, cold, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour,
+	})
+	e := put(t, tier, "bkt", "k", "data")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tier.Run(ctx, 10*time.Millisecond)
+
+	clk.advance(2 * time.Hour)
+	setControl(t, tier, "auto_enabled", "0")
+	tier.consumeControl(context.Background())
+	time.Sleep(80 * time.Millisecond) // several loop ticks
+	if _, err := hot.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("resource migrated while auto migration is paused")
+	}
+
+	setControl(t, tier, "auto_enabled", "1")
+	tier.consumeControl(context.Background())
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := cold.Head(context.Background(), e.ID); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resource not migrated after resume")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestControlColdAfterOverride(t *testing.T) {
+	// Discovery background: threshold must be changeable at runtime; the
+	// DB row is the only channel, so RunOnce reads it through ov. Deleting
+	// the row reverts to Config.
+	tier, hot, _, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: 24 * time.Hour,
+	})
+	e := put(t, tier, "bkt", "k", "data")
+	clk.advance(time.Hour)
+
+	// Override cold_after to 30min: the 1h-old resource qualifies.
+	setControl(t, tier, "cold_after_ms", "1800000")
+	tier.consumeControl(context.Background())
+	tier.RunOnce()
+	if _, err := hot.Head(context.Background(), e.ID); err == nil {
+		t.Fatal("resource not migrated with tightened cold_after override")
+	}
+
+	// Revert (delete row): Config's 24h applies again, nothing is hot to
+	// move; also the override memory must be gone.
+	clearControl(t, tier, "cold_after_ms")
+	tier.consumeControl(context.Background())
+	ov := tier.ov.Load()
+	if ov.ColdAfter != nil {
+		t.Fatal("deleted control row still overrides")
+	}
+}
+
+func TestControlMaxHotBytesOverride(t *testing.T) {
+	// Quota is a live knob too: config says unlimited, control sets 1
+	// byte, the hot pool drains below it.
+	tier, hot, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e1 := put(t, tier, "bkt", "a", "aa")
+	e2 := put(t, tier, "bkt", "b", "bb")
+
+	setControl(t, tier, "max_hot_bytes", "1")
+	tier.consumeControl(context.Background())
+	tier.RunOnce()
+	// Both resources are 2 bytes > 1-byte quota: everything must drain.
+	if _, err := hot.Head(context.Background(), e1.ID); err == nil {
+		t.Fatal("resource a still hot above override quota")
+	}
+	if _, err := hot.Head(context.Background(), e2.ID); err == nil {
+		t.Fatal("resource b still hot above override quota")
+	}
+}
+
+func TestControlPromoteOverride(t *testing.T) {
+	tier, hot, cold, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour, PromoteOnAccess: false,
+	})
+	e := put(t, tier, "bkt", "k", "data")
+	clk.advance(2 * time.Hour)
+	tier.RunOnce() // config: promote off, so get serves from cold and stays
+	if _, err := cold.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("setup: resource should be cold")
+	}
+	setControl(t, tier, "promote_on_access", "1")
+	tier.consumeControl(context.Background())
+	getBody(t, tier, "bkt", "k")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, err := hot.Head(context.Background(), e.ID)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("promote_on_access override did not promote")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestControlForceMigrate(t *testing.T) {
+	// Commands bypass the idle policy entirely: migrate by key name and by
+	// bare content id.
+	tier, hot, cold, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e := put(t, tier, "bkt", "k", "data")
+
+	queueCommand(t, tier, "migrate", "bkt/k")
+	tier.consumeCommands(context.Background())
+	if _, err := cold.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("force migrate by key did not move the resource")
+	}
+	if _, err := hot.Head(context.Background(), e.ID); err == nil {
+		t.Fatal("source copy left after forced migrate")
+	}
+	// Idempotent-ish: forcing a cold resource to migrate errors cleanly
+	// (logged, never crashes the poller).
+	queueCommand(t, tier, "migrate", e.ID)
+	tier.consumeCommands(context.Background())
+}
+
+func TestControlForcePromote(t *testing.T) {
+	tier, hot, cold, clk := newTestTier(t, Config{
+		Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour,
+	})
+	e := put(t, tier, "bkt", "k", "data")
+	clk.advance(2 * time.Hour)
+	tier.RunOnce()
+	if _, err := cold.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("setup: resource should be cold")
+	}
+	queueCommand(t, tier, "promote", e.ID)
+	tier.consumeCommands(context.Background())
+	if _, err := hot.Head(context.Background(), e.ID); err != nil {
+		t.Fatal("force promote did not move the resource back to hot")
+	}
+}
+
+func TestControlUnknownKeyIgnored(t *testing.T) {
+	// Foreign rows written by a confused admin must not wedge the poller.
+	tier, _, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	setControl(t, tier, "bogus_knob", "42")
+	queueCommand(t, tier, "explode", "everything")
+	tier.consumeControl(context.Background())
+	tier.consumeCommands(context.Background())
+	if !tier.autoOn.Load() {
+		t.Fatal("unknown row flipped the pause flag")
+	}
+}
