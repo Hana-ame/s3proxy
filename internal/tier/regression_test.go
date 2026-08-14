@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -816,5 +817,162 @@ func TestReviewCorrectMD5HexAccepted(t *testing.T) {
 	}
 	if e.ID == "" {
 		t.Fatal("empty content id")
+	}
+}
+
+// TestReviewHotAlsoColdRejectedAtNew — a cold list naming the hot pool must
+// be refused by New() before any migration can run.
+//
+// Discovery background: 2026-08 review — a misconfigured
+// tiering.cold containing the hot pool name made transfer(hot→hot) re-put
+// an object onto itself and then delete the source: the ONLY copy, while
+// the index still claimed the object existed. Verified end-to-end with the
+// s3-admin migrate command (bytes gone, reads 404, heal() finds nothing);
+// RunOnce (idle/quota path) hits the same code when the object ages.
+// Fix: New() rejects hot∈cold; transfer() additionally refuses same-pool
+// pairs outright (TestReviewTransferSamePoolRefused).
+func TestReviewHotAlsoColdRejectedAtNew(t *testing.T) {
+	hot := store.NewMem("hot")
+	cold := store.NewMem("cold")
+	tier, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold", "hot"}}, t.TempDir()+"/tier.db")
+	if err == nil {
+		tier.Close()
+		t.Fatal("New accepted a cold list containing the hot pool")
+	}
+}
+
+// TestReviewTransferSamePoolRefused — transfer() must refuse to move a
+// resource between two references to the same pool, even when called
+// directly (the config and New() guards are bypassed deliberately here).
+//
+// Discovery background: companion to TestReviewHotAlsoColdRejectedAtNew —
+// the guard belongs at the mechanism as well as the config, because a
+// future caller (or a pool list with two entries pointing at the same
+// Store) would otherwise reconstruct the data loss: copy onto itself, row
+// flip (no-op), Delete of the only copy.
+func TestReviewTransferSamePoolRefused(t *testing.T) {
+	tier, hot, _, _ := newTestTier(t, Config{Hot: "hot", Cold: []string{"cold"}})
+	e := put(t, tier, "bkt", "k", "payload")
+	if err := tier.transfer(context.Background(), e.ID, hot, hot); err == nil {
+		t.Fatal("transfer(hot→hot) succeeded")
+	}
+	if got := getBody(t, tier, "bkt", "k"); got != "payload" {
+		t.Fatalf("bytes lost after refused same-pool transfer: %q", got)
+	}
+}
+
+// gateStore wraps a MemStore so every Put is counted (atomically) and then
+// parks on a gate channel until the test lets it through. Used to hold a
+// read-through promotion in flight while concurrent reads pile up, so the
+// test can observe how many transfers actually ran.
+type gateStore struct {
+	store.Store
+	mu   sync.Mutex
+	puts int32         // total Put calls (including ones parked on the gate)
+	gate chan struct{} // nil = open; non-nil = block until closed
+}
+
+func (g *gateStore) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string, opts store.PutOptions) (store.ObjectInfo, error) {
+	g.mu.Lock()
+	g.puts++
+	gate := g.gate
+	g.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return g.Store.Put(ctx, key, r, size, contentType, opts)
+}
+
+// TestReviewPromoteSingleflight — concurrent cold reads of one object must
+// collapse onto a single read-through promotion, not spawn one full
+// transfer per request.
+//
+// Discovery background: 2026-08 review — GetObject launched a fresh
+// `go t.promote(...)` for every cold read, so PromoteOnAccess + a read
+// storm (bulk download, cache warm-up) ran N goroutines and N byte copies
+// of the same object before the row flip serialized them. Fix:
+// startPromote keeps a per-id in-flight set; the test holds the transfer
+// mid-flight (gated Put) while N reads race, and asserts exactly ONE
+// transferred byte copy reaches the hot pool.
+func TestReviewPromoteSingleflight(t *testing.T) {
+	clk := &clock{t: time.Now()}
+	hot := &gateStore{Store: store.NewMem("hot")}
+	cold := store.NewMem("cold")
+	tr, err := New([]store.Store{hot, cold}, Config{Hot: "hot", Cold: []string{"cold"}, ColdAfter: time.Hour, PromoteOnAccess: true}, t.TempDir()+"/tier.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	tr.SetNow(clk.now)
+	put(t, tr, "bkt", "k", "cold-data")
+	clk.advance(2 * time.Hour)
+	tr.RunOnce() // migrate to cold: hot.puts reaches 2 (put + transfer copy)
+
+	// Park the next Put (the promotion's hot write) and race the reads.
+	hot.mu.Lock()
+	hot.puts = 0 // count only post-setup activity; migration is done
+	hot.gate = make(chan struct{})
+	hot.mu.Unlock()
+
+	const readers = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, _, err := tr.GetObject(context.Background(), "bkt", "k", store.Range{Start: 0, End: -1})
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer res.Body.Close()
+			b, err := io.ReadAll(res.Body)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if string(b) != "cold-data" {
+				errs <- fmt.Errorf("read body %q", b)
+			}
+		}()
+	}
+	// Each read parks in the promote's gated Put; poll until ONE transfer
+	// copy is parked (count==1) with a hard deadline — more means
+	// per-request promotes slipped through.
+	deadline := time.Now().Add(5 * time.Second)
+	got := int32(0)
+	for time.Now().Before(deadline) {
+		hot.mu.Lock()
+		got = hot.puts
+		hot.mu.Unlock()
+		if got == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got != 1 {
+		close(hot.gate)
+		wg.Wait()
+		t.Fatalf("promote transfers = %d, want exactly 1 (per-request promote leaked)", got)
+	}
+	// Let the single promote finish, then verify the object is back in hot.
+	close(hot.gate)
+	wg.Wait()
+	select {
+	case e := <-errs:
+		t.Fatal(e)
+	default:
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		e, err := tr.HeadObject(context.Background(), "bkt", "k")
+		if err == nil && e.Pool == "hot" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if e, err := tr.HeadObject(context.Background(), "bkt", "k"); err != nil || e.Pool != "hot" {
+		t.Fatalf("object not promoted back to hot: pool=%q err=%v", e.Pool, err)
 	}
 }
