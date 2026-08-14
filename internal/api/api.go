@@ -7,6 +7,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -162,6 +163,14 @@ func vhostBucket(host, baseHost string) (string, error) {
 	if baseHost == "" {
 		return "", nil
 	}
+	// r.Host always carries the port for non-default ports
+	// ("bucket.s3.example.com:9000"); the suffix match must be done on
+	// the bare hostname or every virtual-host request through a port
+	// silently falls back to path-style (bucket parsed from the path,
+	// signature mismatch -> 403). Discovery background: 2026-08 review —
+	// vhost addressing worked only for default-port setups.
+	host = hostOnly(host)
+	baseHost = hostOnly(baseHost)
 	if host == baseHost {
 		return "", nil
 	}
@@ -175,6 +184,16 @@ func vhostBucket(host, baseHost string) (string, error) {
 		return "", errBadBucket
 	}
 	return "", nil
+}
+
+// hostOnly strips the port from a Host header value, keeping IPv6 literals
+// intact (SplitHostPort requires brackets for them, and no port leaves the
+// string untouched).
+func hostOnly(h string) string {
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return host
+	}
+	return h
 }
 
 // validBucket mirrors the S3 bucket naming rules loosely: 3-63 chars,
@@ -240,5 +259,5 @@ func requestLocation(r *http.Request, bucket, key string) string {
 	if host == "" {
 		host = r.URL.Host
 	}
-	return scheme + "://" + host + "/" + bucket + "/" + key
+	return scheme + "://" + host + "/" + url.PathEscape(bucket) + "/" + url.PathEscape(key)
 }

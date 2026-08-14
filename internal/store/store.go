@@ -166,12 +166,26 @@ func NewMem(name string) *MemStore {
 func (m *MemStore) Name() string { return m.name }
 
 func (m *MemStore) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string, opts PutOptions) (ObjectInfo, error) {
-	data, err := io.ReadAll(io.LimitReader(r, size+1))
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	if int64(len(data)) != size {
-		return ObjectInfo{}, io.ErrUnexpectedEOF
+	// size<0 means "unknown" (chunked upload): read to EOF like the local
+	// pool does. Discovery background: 2026-08 review — LimitReader(r, 0)
+	// produced an empty body for every chunked PUT, silently storing 0
+	// bytes (the tier trusts Size, so readers got nothing and the pool
+	// index still reported the advertised size).
+	var data []byte
+	if size < 0 {
+		var err error
+		if data, err = io.ReadAll(r); err != nil {
+			return ObjectInfo{}, err
+		}
+		size = int64(len(data))
+	} else {
+		var err error
+		if data, err = io.ReadAll(io.LimitReader(r, size+1)); err != nil {
+			return ObjectInfo{}, err
+		}
+		if int64(len(data)) != size {
+			return ObjectInfo{}, io.ErrUnexpectedEOF
+		}
 	}
 	bucket, _, _ := strings.Cut(key, "/")
 	m.mu.Lock()

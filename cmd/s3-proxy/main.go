@@ -161,6 +161,28 @@ func (c config) validate() error {
 	if len(c.Tiering.Hot) != 1 {
 		return fmt.Errorf("tiering.hot must name exactly one hot pool")
 	}
+	// The hot pool must never double as a cold target: transfer(hot→hot)
+	// re-puts an object onto itself and then deletes the source — the only
+	// copy — while the index still claims the object exists (silent data
+	// loss, reads 404 forever). Discovery background: 2026-08 review —
+	// verified end-to-end via `s3-admin migrate` with a misconfigured
+	// cold list; RunOnce hits the same path via idle/quota candidates.
+	// tier.New() guards programmatic users; this check gives the operator
+	// a clear startup error.
+	hotName := c.Tiering.Hot[0]
+	seenCold := make(map[string]bool)
+	for _, name := range c.Tiering.Cold {
+		if name == hotName {
+			return fmt.Errorf("tiering.cold must not contain the hot pool %q", hotName)
+		}
+		if seenCold[name] {
+			// A duplicate cold entry double-weights the round-robin
+			// cursor and hides the intent; harmless alone, but it is
+			// always a config mistake.
+			return fmt.Errorf("duplicate pool %q in tiering.cold", name)
+		}
+		seenCold[name] = true
+	}
 	for _, name := range append(append([]string{}, c.Tiering.Hot...), c.Tiering.Cold...) {
 		if !seen[name] {
 			return fmt.Errorf("tiering references pool %q that is not defined", name)

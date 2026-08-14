@@ -317,7 +317,10 @@ func TestListAcrossTiersWithDelimiter(t *testing.T) {
 	clk.advance(2 * time.Hour)
 	tier.RunOnce()
 
-	res, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Delimiter: "/"})
+	// Explicit page size: 0 now means "empty page" (S3 semantics for
+	// max-keys=0, see TestReviewMaxKeysZeroEmptyPage), so unlimited pages
+	// request 1000 explicitly.
+	res, err := tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Delimiter: "/", MaxKeys: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +331,7 @@ func TestListAcrossTiersWithDelimiter(t *testing.T) {
 		t.Fatalf("delimiter prefixes: %+v", res.CommonPrefixes)
 	}
 
-	res, err = tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Prefix: "dir/", Delimiter: "/"})
+	res, err = tier.ListObjects(context.Background(), ListParams{Bucket: "bkt", Prefix: "dir/", Delimiter: "/", MaxKeys: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}

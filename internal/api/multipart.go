@@ -472,6 +472,16 @@ func (s *Server) handleListParts(w http.ResponseWriter, r *http.Request, request
 		writeError(w, r, &s3Err{status: http.StatusNotFound, code: "NoSuchUpload", message: "The specified multipart upload does not exist."}, requestID)
 		return
 	}
+	// The upload manifest is authoritative for bucket/key (AWS: a request
+	// that references an upload by ID under a different bucket/key is
+	// NoSuchUpload, not an echoed mismatch).
+	// Discovery background: 2026-08 review — the URL bucket/key were
+	// echoed while the parts came from the manifest; a mismatched request
+	// silently returned another upload's parts.
+	if m.Bucket != bucket || m.Key != key {
+		writeError(w, r, &s3Err{status: http.StatusNotFound, code: "NoSuchUpload", message: "The specified multipart upload does not exist."}, requestID)
+		return
+	}
 	q := r.URL.Query()
 	marker := 0
 	if v := q.Get("part-number-marker"); v != "" {
@@ -600,6 +610,17 @@ func (s *Server) handleCompleteMultipart(w http.ResponseWriter, r *http.Request,
 	defer unlock()
 	m, err := s.uploads.load(uploadID)
 	if err != nil {
+		writeError(w, r, &s3Err{status: http.StatusNotFound, code: "NoSuchUpload", message: "The specified multipart upload does not exist."}, requestID)
+		return
+	}
+	// Same scoping rule as handleListParts: an upload referenced under a
+	// different bucket/key than it was initiated for is NoSuchUpload —
+	// completing an upload through another key would otherwise write the
+	// manifest's parts under the wrong name.
+	// Discovery background: 2026-08 review — URL bucket/key were ignored
+	// entirely; a request against a different key still completed the
+	// upload and wrote the object under the URL key.
+	if m.Bucket != bucket || m.Key != key {
 		writeError(w, r, &s3Err{status: http.StatusNotFound, code: "NoSuchUpload", message: "The specified multipart upload does not exist."}, requestID)
 		return
 	}

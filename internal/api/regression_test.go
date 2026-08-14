@@ -4,6 +4,7 @@ package api
 // documents how the bug was discovered and what fix it protects.
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,11 +13,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
 	"s3proxy/internal/store"
 	"s3proxy/internal/tier"
@@ -483,4 +488,153 @@ func mustJSON(t *testing.T, m *uploadMeta) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestReviewVhostResolvesWithPort — virtual-host requests whose Host header
+// carries a port must still resolve the bucket.
+//
+// Discovery background: 2026-08 review of vhostBucket — the suffix match
+// ran against the raw r.Host, and any non-default port
+// ("bkt.s3.example.com:9000") broke it: the request silently fell back to
+// path-style parsing, the bucket was taken from the URL path, and the
+// signature (canonical host header signed over the vhost name WITH port)
+// could never match — every real virtual-host request through a port got
+// 403 SignatureDoesNotMatch. Fix: strip the port before matching, on both
+// sides of the comparison.
+func TestReviewVhostResolvesWithPort(t *testing.T) {
+	hot := store.NewMem("hot")
+	cold := store.NewMem("cold")
+	tr, err := tier.New([]store.Store{hot, cold}, tier.Config{Hot: "hot", Cold: []string{"cold"}}, t.TempDir()+"/tier.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tr.Close() })
+	srv, err := New(tr, testCreds(), "us-east-1", "s3.example.com", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	// Sign against the virtual host INCLUDING the port. The SDK signer
+	// uses req.Host for the canonical host header and the delivered
+	// request carries the same Host — exactly what a client pointed at
+	// http://bkt.s3.example.com:9000 sends (the URL host only routes the
+	// connection to the test server).
+	do := func(method, path string, body []byte) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+path, strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "bkt.s3.example.com:9000"
+		payload := unsignedPayload
+		if len(body) > 0 {
+			payload = sha256Hex(body)
+		}
+		req.Header.Set("X-Amz-Content-Sha256", payload)
+		signer := v4.NewSigner()
+		if err := signer.SignHTTP(context.Background(), aws.Credentials{AccessKeyID: testAK, SecretAccessKey: testSK}, req, payload, "s3", "us-east-1", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	if resp := do("PUT", "/", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("vhost create bucket: %d %s", resp.StatusCode, readAll(t, resp))
+	} else {
+		readAll(t, resp)
+	}
+	if resp := do("PUT", "/key", []byte("vhost-data")); resp.StatusCode != http.StatusOK {
+		t.Fatalf("vhost put: %d %s", resp.StatusCode, readAll(t, resp))
+	} else {
+		readAll(t, resp)
+	}
+	get := do("GET", "/key", nil)
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("vhost get: %d %s", get.StatusCode, readAll(t, get))
+	}
+	if got := readAll(t, get); got != "vhost-data" {
+		t.Fatalf("vhost round-trip got %q", got)
+	}
+}
+
+// TestReviewMaxKeysZeroEmptyPage — max-keys=0 is a valid AWS page size.
+//
+// Discovery background: 2026-08 review — tier.ListObjects collapsed
+// MaxKeys<=0 to 1000, so a `?max-keys=0` probe (tooling tests emptiness
+// this way) returned the whole bucket. Fix: 0 emits an empty page that
+// stays IsTruncated when keys match, and the continuation token advances
+// past the scan position so the follow-up request does not loop on empty
+// pages.
+func TestReviewMaxKeysZeroEmptyPage(t *testing.T) {
+	ts, _, _ := newTestServer(t, "hot", "cold", tier.Config{Hot: "hot", Cold: []string{"cold"}})
+	doSigned(t, "PUT", ts.URL+"/bkt", nil, nil).Body.Close()
+	for _, k := range []string{"a.txt", "b.txt"} {
+		doSigned(t, "PUT", ts.URL+"/bkt/"+k, []byte(k), nil).Body.Close()
+	}
+	resp := doSigned(t, "GET", ts.URL+"/bkt?list-type=2&max-keys=0", nil, nil)
+	body := readAll(t, resp)
+	if strings.Contains(body, "<Key>") {
+		t.Fatalf("max-keys=0 must not emit keys: %s", body)
+	}
+	if !strings.Contains(body, "<KeyCount>0</KeyCount>") || !strings.Contains(body, "<IsTruncated>true</IsTruncated>") {
+		t.Fatalf("max-keys=0 must report a truncated empty page: %s", body)
+	}
+	var doc struct {
+		NextToken string `xml:"NextContinuationToken"`
+	}
+	if err := xml.Unmarshal([]byte(body), &doc); err != nil || doc.NextToken == "" {
+		t.Fatalf("max-keys=0 must return an advancing token: %q err=%v", doc.NextToken, err)
+	}
+	// The token resumes after the scanned position; the remaining keys
+	// come back on the next page.
+	resp = doSigned(t, "GET", ts.URL+"/bkt?list-type=2&max-keys=10&continuation-token="+doc.NextToken, nil, nil)
+	if body = readAll(t, resp); !strings.Contains(body, "<Key>b.txt</Key>") {
+		t.Fatalf("continuation after max-keys=0 page: %s", body)
+	}
+}
+
+// TestReviewMultipartUploadScope — ListParts/Complete against a URL
+// bucket/key different from the upload's own must be NoSuchUpload, never
+// an echo of another upload's parts or a write under the URL key.
+//
+// Discovery background: 2026-08 review — handleListParts served the
+// manifest's parts under any URL key, and handleCompleteMultipart ignored
+// the URL bucket/key entirely: a POST against a different key completed
+// the upload and wrote the assembled object there. AWS scopes an upload
+// to the bucket/key it was initiated for.
+func TestReviewMultipartUploadScope(t *testing.T) {
+	ts, _, _ := newTestServer(t, "hot", "cold", tier.Config{Hot: "hot", Cold: []string{"cold"}})
+	doSigned(t, "PUT", ts.URL+"/bkt", nil, nil).Body.Close()
+	resp := doSigned(t, "POST", ts.URL+"/bkt/real.txt?uploads", nil, nil)
+	var init struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal([]byte(readAll(t, resp)), &init); err != nil {
+		t.Fatal(err)
+	}
+	// ListParts through another key.
+	resp = doSigned(t, "GET", ts.URL+"/bkt/other.txt?uploadId="+init.UploadID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("list-parts under foreign key: %d %s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+	// Complete through another key.
+	resp = doSigned(t, "POST", ts.URL+"/bkt/other.txt?uploadId="+init.UploadID, []byte("<CompleteMultipartUpload></CompleteMultipartUpload>"), nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("complete under foreign key: %d %s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+	// Nothing was written under either key.
+	for _, k := range []string{"real.txt", "other.txt"} {
+		resp = doSigned(t, "GET", ts.URL+"/bkt/"+k, nil, nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s exists after scoped rejection: %d", k, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
 }

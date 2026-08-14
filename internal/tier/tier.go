@@ -186,6 +186,15 @@ type TieredStore struct {
 	// which the Run loop reads and test code flips via control rows):
 	autoOn atomic.Bool // false = background migration loop is paused
 	ov     atomic.Pointer[overrides]
+
+	// promoBusy dedupes in-flight read-through promotions per content id.
+	// Discovery background: 2026-08 review — GetObject launched one
+	// `go t.promote(...)` per cold read, so a read storm (bulk download of
+	// a cold bucket) spawned one goroutine and one full transfer per
+	// request; every transfer re-copied the bytes before the row flip
+	// serialized them. startPromote collapses those onto one transfer.
+	promoMu   sync.Mutex
+	promoBusy map[string]bool
 }
 
 // SetNow injects a test clock. Not for production use.
@@ -271,6 +280,7 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		res:       make(map[string]*resRow),
 		buckets:   make(map[string]time.Time),
 		keyLocks:  lockTable{locks: make(map[string]*lockEntry)},
+		promoBusy: make(map[string]bool),
 	}
 	t.autoOn.Store(true) // auto migration starts enabled; control can pause
 	// Ensure the sentinel exists so the watcher can attach to it; existing
@@ -290,6 +300,19 @@ func New(pools []store.Store, cfg Config, statePath string) (*TieredStore, error
 		return nil, fmt.Errorf("tier: hot pool %q not found", cfg.Hot)
 	}
 	for _, name := range cfg.Cold {
+		if name == cfg.Hot {
+			// transfer(hot→hot) destroys the only copy: it re-puts the
+			// object onto itself, flips the row (a no-op), then deletes
+			// the source — the index still claims the object exists, but
+			// reads 404 forever and heal() finds nothing. Discovery
+			// background: 2026-08 review — verified end-to-end with an
+			// s3-admin migrate; RunOnce (idle/quota) hits the same path
+			// when a misconfigured cold list names the hot pool. The
+			// config validate() in cmd/s3-proxy rejects this earlier; the
+			// tier New() guard protects programmatic users too.
+			db.Close()
+			return nil, fmt.Errorf("tier: cold pool %q is also the hot pool (data loss on migration)", name)
+		}
 		if _, ok := t.pools[name]; !ok {
 			db.Close()
 			return nil, fmt.Errorf("tier: cold pool %q not found", name)
@@ -837,7 +860,13 @@ func (t *TieredStore) PutObject(ctx context.Context, bucket, key string, r io.Re
 	unlockRes()
 	if oldID != "" && oldID != id {
 		if err := t.releaseContent(ctx, oldID); err != nil {
-			return Entry{}, err
+			// The new mapping is committed below regardless; the old
+			// refcount was already decremented in memory. Failing the
+			// response now would report a write that succeeded, and the
+			// stale DB mirror is repaired by reconcileRefs at restart.
+			// Discovery background: 2026-08 review — the error was
+			// returned, turning a committed write into a spurious 500.
+			log.Printf("tier: put %s: release old content: %v", fk, err)
 		}
 	}
 
@@ -1123,7 +1152,13 @@ func (t *TieredStore) CopyObject(ctx context.Context, dstBucket, dstKey, srcBuck
 	unlockRes()
 	if oldID != "" && oldID != id {
 		if err := t.releaseContent(ctx, oldID); err != nil {
-			return Entry{}, err
+			// The mapping above is committed and the old refcount was
+			// already decremented in memory; the stale DB mirror is
+			// repaired by reconcileRefs at restart. Same rationale as the
+			// PutObject path — a spurious failure would have reported a
+			// copied write as failed.
+			// Discovery background: 2026-08 review — see PutObject.
+			log.Printf("tier: copy %s: release old content: %v", fk, err)
 		}
 	}
 	return e, nil
@@ -1174,7 +1209,7 @@ func (t *TieredStore) GetObject(ctx context.Context, bucket, key string, rng sto
 		// PromoteOnAccess. Discovery background: code review — promote
 		// inherited the request ctx, so a disconnect mid-transfer aborted
 		// the copy every time.
-		go t.promote(context.WithoutCancel(ctx), e.ID)
+		t.startPromote(context.WithoutCancel(ctx), e.ID)
 	}
 	return res, e, nil
 }
@@ -1345,7 +1380,17 @@ type ListResult struct {
 // ListObjects pages the name layer (the merged view across tiers — pools
 // cannot group, and names only exist here).
 func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult, error) {
-	if p.MaxKeys <= 0 {
+	// max-keys=0 is a legal AWS page size (an empty page that stays
+	// truncated when more keys match); only negative values fall back to
+	// the 1000 default, and oversized pages are clamped — AWS rejects
+	// >1000, lenient clamping keeps naive clients working.
+	// Discovery background: 2026-08 review — <=0 collapsed to 1000, so
+	// `?max-keys=0` probes (some tooling checks emptiness this way)
+	// silently returned up to a thousand keys.
+	if p.MaxKeys < 0 {
+		p.MaxKeys = 1000
+	}
+	if p.MaxKeys > 1000 {
 		p.MaxKeys = 1000
 	}
 	base := p.Bucket + "/"
@@ -1399,6 +1444,13 @@ func (t *TieredStore) ListObjects(ctx context.Context, p ListParams) (ListResult
 		// not advance the token past a key that was never emitted.
 		if emitted >= p.MaxKeys {
 			truncated = true
+			if p.MaxKeys == 0 {
+				// Empty page: AWS still reports IsTruncated when more keys
+				// match, and the next token must advance past the current
+				// position, or a continuation request would loop on empty
+				// pages forever (token stays "" forever).
+				lastEmitted = fk
+			}
 			break
 		}
 		lastEmitted = fk
@@ -1942,6 +1994,31 @@ func (t *TieredStore) nextCold() store.Store {
 	return colds[i%uint64(len(colds))]
 }
 
+// startPromote launches a background read-through promotion at most once
+// per in-flight content id. Concurrent cold reads of the same object
+// collapse onto the single transfer instead of each spawning a goroutine
+// (and a full byte copy) of their own — without this, a cold bucket read
+// storm piles up as many transfers as requests, all re-copying the same
+// bytes before the row flip serializes them. A finished (success or
+// failure) promote clears the mark, so the next read retries.
+func (t *TieredStore) startPromote(ctx context.Context, id string) {
+	t.promoMu.Lock()
+	if t.promoBusy[id] {
+		t.promoMu.Unlock()
+		return
+	}
+	t.promoBusy[id] = true
+	t.promoMu.Unlock()
+	go func() {
+		defer func() {
+			t.promoMu.Lock()
+			delete(t.promoBusy, id)
+			t.promoMu.Unlock()
+		}()
+		t.promote(ctx, id)
+	}()
+}
+
 // promote moves a cold resource back to hot after it was served,
 // impersonating a cache read-through. Must NOT hold any key lock here:
 // transfer() takes the content-id lock itself and lockKey is not reentrant
@@ -1973,6 +2050,16 @@ func (t *TieredStore) promote(ctx context.Context, id string) {
 // zero-refcount release serializes on the content-id lock; the re-check
 // below prevents moving a resource that was deleted meanwhile.
 func (t *TieredStore) transfer(ctx context.Context, id string, from, to store.Store) error {
+	if from.Name() == to.Name() {
+		// Never copy a resource onto itself: the final from.Delete below
+		// removes the ONLY copy — the row survives pointing at the pool,
+		// reads 404 forever, heal() probes every other pool and finds
+		// nothing (verified data loss; see TestReviewTransferSamePool).
+		// Config rejects hot∈cold at startup; this guard keeps the
+		// invariant local for any future caller that builds a transfer
+		// from untrusted pool names.
+		return fmt.Errorf("transfer %s: source and target pool are both %q", shortID(id), from.Name())
+	}
 
 	t.mu.Lock()
 	r, ok := t.res[id]
