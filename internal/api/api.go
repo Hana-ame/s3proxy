@@ -137,13 +137,13 @@ func parseTarget(r *http.Request, baseHost string) (bucket, key string, err erro
 
 // joinSegments decodes each escaped segment and rejoins with slashes,
 // preserving keys containing literal slashes ("a%2Fb" stays one key with a
-// slash inside).
+// slash inside) AND empty segments ("a//b" and a trailing slash "a/" are
+// legal S3 keys, so they must round-trip verbatim). Discovery background:
+// the old code skipped empty segments, silently rewriting "dir//file" into
+// "dir/file" and turning a trailing-slash key into a plain key.
 func joinSegments(segs []string) string {
-	var parts []string
+	parts := make([]string, 0, len(segs))
 	for _, seg := range segs {
-		if seg == "" {
-			continue
-		}
 		if dec, err := urlPathUnescape(seg); err == nil {
 			seg = dec
 		}

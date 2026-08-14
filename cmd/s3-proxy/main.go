@@ -20,7 +20,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"s3proxy/internal/api"
@@ -242,10 +244,34 @@ func main() {
 	}
 	log.Printf("s3-proxy listening on %s (region %s, hot=%v, cold=%v, cold_after=%s)",
 		cfg.Listen, cfg.Region, cfg.Tiering.Hot, cfg.Tiering.Cold, cfg.Tiering.ColdAfter.Duration)
-	switch {
-	case cfg.TLSCert != "":
-		log.Fatal(srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey))
-	default:
-		log.Fatal(srv.ListenAndServe())
+
+	errCh := make(chan error, 1)
+	go func() {
+		if cfg.TLSCert != "" {
+			errCh <- srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			errCh <- srv.ListenAndServe()
+		}
+	}()
+
+	// Graceful shutdown: drain in-flight requests, then stop the
+	// migration loop and release the pools. The index is write-through,
+	// so a hard kill is safe; the graceful path just lets in-flight
+	// uploads finish instead of truncating them mid-body.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	case <-stop:
+		log.Printf("shutting down (draining in-flight requests, max 30s)")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		srv.Shutdown(shutdownCtx)
+		cancel()
+		t.Close()
+		log.Printf("shutdown complete")
 	}
 }

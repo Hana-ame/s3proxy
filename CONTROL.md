@@ -42,7 +42,7 @@ FROM resources;
 
 ### 1. 运行时策略覆盖 — `control(k, v)`
 
-`k` 是主键,`INSERT OR REPLACE` 覆盖,**`DELETE FROM control WHERE k=...` 即恢复配置文件默认值**(下一轮轮询生效)。
+`k` 是主键,`INSERT OR REPLACE` 覆盖,**`DELETE FROM control WHERE k=...` 即恢复配置文件默认值**(下次消费——touch 哨兵触发或 60s 兜底——生效)。注意 `auto_enabled` 的默认值是开启:删除该行即恢复自动迁移。
 
 | k | v | 作用 | 示例 |
 |---|---|---|---|

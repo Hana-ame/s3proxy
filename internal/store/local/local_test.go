@@ -35,6 +35,39 @@ func TestTraversalRejected(t *testing.T) {
 	}
 }
 
+// TestEmptyObjectGet — a full GET of a 0-byte object must succeed with an
+// empty body.
+//
+// Discovery background: found during the 2026-08 review. local.Get
+// resolved the open-ended range {0,-1} down to end=size-1=-1 and then
+// rejected start(0) > end(-1) as an invalid range, so every GET of an
+// empty object returned an error that the tier surfaced as 500 — while
+// MemStore served it fine. Fix: size==0 returns an empty body before the
+// range math.
+func TestEmptyObjectGet(t *testing.T) {
+	s, err := New("local", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := s.Put(ctx, "b/k", strings.NewReader(""), 0, "application/octet-stream", store.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, "b/k", store.Range{Start: 0, End: -1})
+	if err != nil {
+		t.Fatalf("empty-object GET failed: %v", err)
+	}
+	defer got.Body.Close()
+	buf := make([]byte, 4)
+	n, err := got.Body.Read(buf)
+	if n != 0 || err == nil {
+		t.Fatalf("empty body served %d bytes (%v)", n, err)
+	}
+	if got.Info.Size != 0 {
+		t.Fatalf("info size = %d", got.Info.Size)
+	}
+}
+
 func TestPutGetDeleteRoundTrip(t *testing.T) {
 	s, err := New("local", t.TempDir())
 	if err != nil {

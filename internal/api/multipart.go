@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -50,36 +51,137 @@ type uploadMeta struct {
 	Parts        []partMeta        `json:"parts"`
 }
 
+// staleUploadTTL is the age past which an upload (and its staged parts) is
+// treated as abandoned and removed. Discovery background: code review — the
+// staging area had no lifecycle: an interrupted upload left its parts on
+// disk forever (unbounded disk growth, easy DoS). S3 aborts idle uploads
+// after 24h, so the same bound applies here.
+const staleUploadTTL = 24 * time.Hour
+
 // uploadStore owns the on-disk staging area for in-flight uploads.
 type uploadStore struct {
 	root string // <stateDir>/uploads
 
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex // per-upload lock, so parallel part uploads of one upload serialize on the manifest only
+	locks uploadLockTable // per-upload lock, so parallel part uploads of one upload serialize on the manifest only
+
+	lastCleanup time.Time // throttle: cleanupStale runs at most once per cleanupMinInterval
 }
+
+// uploadLockTable is a refcounted mutex table (the same design as the tier
+// package's lockTable): entries are dropped once nobody holds or waits on
+// them. Discovery background: 2026-08 review — the original
+// map[string]*sync.Mutex never removed entries. In-flight uploads are
+// bounded, but upload ids are random 32-hex, so over months of operation
+// the map grew monotonically by one mutex per historically initiated
+// upload — the exact unbounded-memory pattern the tier lockTable was
+// written to fix.
+type uploadLockTable struct {
+	mu    sync.Mutex
+	locks map[string]*uploadLockEntry
+}
+
+type uploadLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock acquires the lock for id and returns the release func. Waiters
+// increment refs BEFORE blocking on the mutex, so an entry is removed only
+// when nobody holds or waits on it — a later lock for the same id can never
+// race a removal (which would split one logical lock into two mutexes).
+func (lt *uploadLockTable) lock(id string) func() {
+	lt.mu.Lock()
+	e := lt.locks[id]
+	if e == nil {
+		e = &uploadLockEntry{}
+		lt.locks[id] = e
+	}
+	e.refs++
+	lt.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		lt.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(lt.locks, id)
+		}
+		lt.mu.Unlock()
+	}
+}
+
+// cleanupMinInterval bounds how often cleanupStale walks the whole uploads
+// directory. Discovery background: cleanup ran on every initiate/part
+// request, an O(in-flight uploads) directory scan per upload op — a busy
+// proxy with many concurrent uploads burned the disk listing on every
+// part. A once-per-minute sweep is ample (staleness is measured in hours).
+const cleanupMinInterval = time.Minute
 
 func newUploadStore(stateDir string) (*uploadStore, error) {
 	root := filepath.Join(stateDir, "uploads")
 	if err := os.MkdirAll(filepath.Join(root, "parts"), 0o755); err != nil {
 		return nil, err
 	}
-	return &uploadStore{root: root, locks: make(map[string]*sync.Mutex)}, nil
+	return &uploadStore{root: root, locks: uploadLockTable{locks: make(map[string]*uploadLockEntry)}}, nil
+}
+
+// cleanupStale removes uploads older than staleUploadTTL together with
+// their staged parts. The manifest is re-loaded UNDER the per-upload lock
+// and the removal happens under that same lock. Discovery background: a
+// first version checked staleness under the lock but removed the files
+// AFTER unlocking — a part upload that started right after the check could
+// land mid-removal and have its fresh part directory wiped (and the
+// manifest saved over a removed one), contradicting "an active upload
+// wins". Holding the lock through the removal makes an upload either
+// finish before the removal (then it is removed — it is >24h old by its
+// own initiation time, S3 semantics) or fail cleanly with NoSuchUpload.
+func (u *uploadStore) cleanupStale(now time.Time) {
+	u.mu.Lock()
+	if now.Sub(u.lastCleanup) < cleanupMinInterval {
+		u.mu.Unlock()
+		return
+	}
+	u.lastCleanup = now
+	u.mu.Unlock()
+
+	entries, err := os.ReadDir(u.root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		unlock := u.lock(id)
+		m, err := u.load(id)
+		if err != nil {
+			// Unreadable manifest: drop the staging dir defensively AND
+			// remove the manifest itself, or every future sweep re-
+			// discovers this id, re-reads the same broken file and
+			// re-removes the (already gone) part dir forever — a
+			// permanent tombstone with no benefit. Discovery background:
+			// 2026-08 review — the .json was left behind.
+			os.RemoveAll(u.partDir(id))
+			os.Remove(u.manifestPath(id))
+			unlock()
+			continue
+		}
+		if now.Sub(m.Initiated) >= staleUploadTTL {
+			// Remove dir first (cheap failure) then the manifest itself.
+			os.RemoveAll(u.partDir(id))
+			os.Remove(u.manifestPath(id))
+		}
+		unlock()
+	}
 }
 
 func (u *uploadStore) manifestPath(id string) string { return filepath.Join(u.root, id+".json") }
 func (u *uploadStore) partDir(id string) string      { return filepath.Join(u.root, "parts", id) }
 
-func (u *uploadStore) lock(id string) func() {
-	u.mu.Lock()
-	m, ok := u.locks[id]
-	if !ok {
-		m = &sync.Mutex{}
-		u.locks[id] = m
-	}
-	u.mu.Unlock()
-	m.Lock()
-	return m.Unlock
-}
+func (u *uploadStore) lock(id string) func() { return u.locks.lock(id) }
 
 func (u *uploadStore) load(id string) (*uploadMeta, error) {
 	data, err := os.ReadFile(u.manifestPath(id))
@@ -135,6 +237,27 @@ func newUploadID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// validUploadID rejects anything but the exact shape newUploadID generates
+// (32 lowercase hex chars). uploadId arrives from the query string and is
+// joined into filesystem paths below, so an unvalidated id (e.g.
+// "../../escape") would read/write outside <stateDir>/uploads — path
+// traversal. Discovery background: 2026-08 review — every uploadId
+// consumer (part upload, list parts, complete, abort) joined the raw
+// string into filepath.Join; exploiting required a crafted JSON manifest
+// readable at the escaped location, but the read/write primitive existed.
+func validUploadID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // --- HTTP handlers ---------------------------------------------------------
 
 type initiateResult struct {
@@ -147,6 +270,7 @@ type initiateResult struct {
 
 // handleCreateMultipartUpload: POST /bucket/key?uploads
 func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, requestID, bucket, key string) {
+	s.uploads.cleanupStale(time.Now())
 	id := newUploadID()
 	m := &uploadMeta{
 		UploadID:     id,
@@ -172,6 +296,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 
 // handleUploadPart: PUT /bucket/key?partNumber=N&uploadId=ID
 func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, requestID, bucket, key string, q url.Values) {
+	s.uploads.cleanupStale(time.Now())
 	uploadID := q.Get("uploadId")
 	partStr := q.Get("partNumber")
 	partNum, err := strconv.Atoi(partStr)
@@ -192,15 +317,19 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, reques
 	}
 
 	// Ranged copy (UploadPartCopy) reuses this path with the source in the
-	// headers instead of the body.
+	// headers instead of the body. The source body is closed on return:
+	// Discovery background — the old code never closed it, leaking one
+	// file descriptor (local pool) / HTTP connection (s3 pool) per
+	// UploadPartCopy.
 	var body io.Reader = r.Body
-	var copyErr error
 	if src := r.Header.Get("x-amz-copy-source"); src != "" {
-		body, copyErr = s.copySourceReader(r, src)
+		srcBody, copyErr := s.copySourceReader(r, src)
 		if copyErr != nil {
 			writeError(w, r, fmtErr("%v", copyErr), requestID)
 			return
 		}
+		body = srcBody
+		defer srcBody.Close()
 	}
 
 	h := md5.New()
@@ -229,20 +358,41 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, reques
 		writeError(w, r, fmtErr("%v", cerr), requestID)
 		return
 	}
+
+	// Content-MD5 is verified against the staged bytes BEFORE the temp
+	// file is renamed into place. A rejected part must leave the staging
+	// dir exactly as it was — in particular, when this part number
+	// already existed, deleting `partPath` here would destroy the OLD
+	// part's .bin while the manifest still points at it, and Complete
+	// would later fail with "staged part lost". Discovery background:
+	// 2026-08 review — the digest check ran after os.Rename and removed
+	// partPath on failure.
+	etag := `"` + hex.EncodeToString(h.Sum(nil)) + `"`
+	if raw := r.Header.Get("Content-MD5"); raw != "" {
+		// Content-MD5 is base64 of the 16-byte digest (RFC 1864), same as
+		// the plain-PUT path. Discovery background: the old code compared
+		// the hex part digest directly against the raw base64 header —
+		// different encodings of the same bytes can never be equal, so
+		// EVERY part upload carrying Content-MD5 failed with BadDigest
+		// (boto3/aws-cli send it by default on large uploads).
+		sum, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+		if err != nil {
+			os.Remove(tmp)
+			writeError(w, r, &s3Err{status: http.StatusBadRequest, code: "InvalidDigest", message: "The Content-MD5 you specified is not valid."}, requestID)
+			return
+		}
+		got := strings.Trim(etag, `"`)
+		if !strings.EqualFold(got, hex.EncodeToString(sum)) {
+			os.Remove(tmp)
+			writeError(w, r, &s3Err{status: http.StatusBadRequest, code: "BadDigest", message: "The Content-MD5 you specified did not match what we received."}, requestID)
+			return
+		}
+	}
+	// The part is now verified; commit it into the visible name.
 	if err := os.Rename(tmp, partPath); err != nil {
 		os.Remove(tmp)
 		writeError(w, r, fmtErr("%v", err), requestID)
 		return
-	}
-
-	etag := `"` + hex.EncodeToString(h.Sum(nil)) + `"`
-	if md5Hex := r.Header.Get("Content-MD5"); md5Hex != "" {
-		got := strings.Trim(etag, `"`)
-		if !strings.EqualFold(got, md5Hex) {
-			os.Remove(partPath)
-			writeError(w, r, &s3Err{status: http.StatusBadRequest, code: "BadDigest", message: "The Content-MD5 you specified did not match what we received."}, requestID)
-			return
-		}
 	}
 	// Replace-or-insert this part number in the manifest.
 	replaced := false
@@ -266,8 +416,9 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, reques
 }
 
 // copySourceReader builds a reader over the x-amz-copy-source object,
-// honoring x-amz-copy-source-range for partial part copies.
-func (s *Server) copySourceReader(r *http.Request, src string) (io.Reader, error) {
+// honoring x-amz-copy-source-range for partial part copies. The caller
+// must Close the returned body.
+func (s *Server) copySourceReader(r *http.Request, src string) (io.ReadCloser, error) {
 	srcBucket, srcKey, ok := parseCopySource(src)
 	if !ok {
 		return nil, errors.New("invalid copy source")
@@ -400,6 +551,13 @@ func (s *Server) handleListMultipartUploads(w http.ResponseWriter, r *http.Reque
 	}
 	out := listUploadsResult{Xmlns: s3Namespace, Bucket: bucket, MaxUploads: 1000}
 	for _, m := range metas {
+		// Only the requested bucket's uploads, like AWS. Discovery
+		// background: code review — every in-flight upload on the whole
+		// state dir leaked into the response, so one tenant's uploads
+		// showed up in another bucket's listing.
+		if m.Bucket != bucket {
+			continue
+		}
 		out.Upload = append(out.Upload, struct {
 			Key          string   `xml:"Key"`
 			UploadID     string   `xml:"UploadId"`

@@ -5,7 +5,7 @@ package api
 // / partNumber / uploads) are dispatched into multipart.go.
 
 import (
-	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -23,6 +23,17 @@ import (
 
 // serveObject dispatches one object-scoped request.
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, requestID, bucket, key string, q url.Values) {
+	// Every uploadId below is used in filesystem paths by the multipart
+	// staging area; a non-hex id (path traversal, arbitrary bytes) is
+	// answered NoSuchUpload before any path is built. Discovery
+	// background: 2026-08 review — see validUploadID in multipart.go.
+	noSuchUpload := func() {
+		writeError(w, r, &s3Err{status: http.StatusNotFound, code: "NoSuchUpload", message: "The specified multipart upload does not exist."}, requestID)
+	}
+	if uid := q.Get("uploadId"); q.Has("uploadId") && !validUploadID(uid) {
+		noSuchUpload()
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if q.Has("uploadId") {
@@ -116,7 +127,13 @@ func parseRange(header string, size int64) (store.Range, bool, error) {
 	}
 	end, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
 	if err != nil || end < start {
-		return store.Range{}, false, errors.New("invalid end range")
+		// A syntactically valid but unsatisfiable single range ("bytes=5-2")
+		// must answer 416 InvalidRange like AWS, not fall through to the
+		// full object. The ok flag tells the handler the header WAS a range
+		// so it can send the 416. Discovery background: 2026-08 review —
+		// this branch returned ok=false, so the caller's `rngErr != nil &&
+		// isRange` guard missed it and served 200 with the entire body.
+		return store.Range{}, true, errors.New("invalid end range")
 	}
 	if end >= size {
 		end = size - 1
@@ -281,42 +298,46 @@ func (s *Server) handleHeadObject(w http.ResponseWriter, r *http.Request, reques
 	w.WriteHeader(http.StatusOK)
 }
 
-// handlePutObject ingests a plain object write. Content-MD5 is verified
-// against a tee'd hash of the request body (a client-side integrity check
-// S3 supports; a mismatch must fail with 400 BadDigest).
+// handlePutObject ingests a plain object write. Content-MD5 is verified by
+// the tier layer WHILE streaming (pre-commit): on mismatch nothing is
+// written and the previous object is untouched. Discovery background: the
+// old code verified the hash AFTER the write and then deleted the whole
+// object, so a failed overwrite lost the previous object too.
 func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, requestID, bucket, key string) {
-	md5Hex := r.Header.Get("Content-MD5")
-	var body io.Reader = r.Body
-	var hasher *hashTee
-	if md5Hex != "" {
-		hasher = &hashTee{r: r.Body, h: md5.New()}
-		body = hasher
+	var md5Hex string
+	if raw := r.Header.Get("Content-MD5"); raw != "" {
+		// Content-MD5 is base64 of the 16-byte digest; the tier layer
+		// compares hex-encoded digests.
+		sum, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+		if err != nil {
+			writeError(w, r, &s3Err{status: http.StatusBadRequest, code: "InvalidDigest", message: "The Content-MD5 you specified is not valid."}, requestID)
+			return
+		}
+		md5Hex = hex.EncodeToString(sum)
 	}
 
-	e, err := s.tier.PutObject(r.Context(), bucket, key, body, r.ContentLength, tier.PutOpts{
+	e, err := s.tier.PutObject(r.Context(), bucket, key, r.Body, r.ContentLength, tier.PutOpts{
 		ContentType:  contentTypeOf(r),
+		MD5Hex:       md5Hex,
 		Metadata:     userMetadata(r),
 		StorageClass: r.Header.Get("x-amz-storage-class"),
 	})
 	if err != nil {
-		writeError(w, r, fmtErr("%v", err), requestID)
-		return
-	}
-	if hasher != nil {
-		got := hex.EncodeToString(hasher.h.Sum(nil))
-		if !strings.EqualFold(got, md5Hex) {
-			// Best-effort cleanup of the just-written object; S3 leaves
-			// nothing behind on BadDigest.
-			s.tier.DeleteObject(r.Context(), bucket, key)
+		if errors.Is(err, tier.ErrBadDigest) {
 			writeError(w, r, &s3Err{status: http.StatusBadRequest, code: "BadDigest", message: "The Content-MD5 you specified did not match what we received."}, requestID)
 			return
 		}
+		writeError(w, r, fmtErr("%v", err), requestID)
+		return
 	}
 	w.Header().Set("ETag", e.ETag)
 	w.WriteHeader(http.StatusOK)
 }
 
-// hashTee passes through the body while hashing it.
+// hashTee passes through the body while hashing it. Still used by
+// multipart part uploads (per-part MD5 for the composite etag); the plain
+// PUT path stopped using it once digest verification moved into the tier
+// layer (pre-commit, see handlePutObject).
 type hashTee struct {
 	r io.Reader
 	h hash.Hash

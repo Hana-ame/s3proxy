@@ -222,6 +222,30 @@ func (s *Store) Get(ctx context.Context, key string, rng store.Range) (store.Get
 		f.Close()
 		return store.GetResult{}, err
 	}
+	// A 0-byte object must still serve a full read: {0,-1} resolves to
+	// end=-1 here, and the start>end guard below would otherwise reject
+	// the empty body as an invalid range (500 on every GET of an empty
+	// object). Discovery background: found during the 2026-08 review —
+	// MemStore handled this, local did not.
+	// Bytes are only served when the file is non-empty: a real range
+	// request (start>=0) can never reach this point for size 0 — the API
+	// layer refuses ranges with start >= object size — so the only
+	// reachable case is the full read, which must yield an empty body.
+	if st.Size() == 0 {
+		body := &rangeReader{f: f, section: io.NewSectionReader(f, 0, 0)}
+		return store.GetResult{
+			Body: body,
+			Info: store.ObjectInfo{
+				Key:          key,
+				Size:         0,
+				ETag:         sc.ETag,
+				ContentType:  sc.ContentType,
+				LastModified: sc.Modified,
+				StorageClass: "STANDARD",
+			},
+			Span: store.Range{Start: 0, End: -1},
+		}, nil
+	}
 	start, end := rng.Start, rng.End
 	if end < 0 || end >= st.Size() {
 		end = st.Size() - 1

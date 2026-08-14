@@ -29,10 +29,16 @@ func main() {
 	}
 
 	// Periodic cleanup of interrupted writes (<key>.tmp), mirroring what
-	// the tier loop does when the pool is embedded.
+	// the tier loop does when the pool is embedded. The age must be large
+	// (24h), not the sweep period: a slow multi-hour upload keeps its .tmp
+	// mtime fresh and must survive every sweep. Discovery background: the
+	// original code passed time.Minute as both period and age — any upload
+	// lasting over a minute had its staging file deleted mid-stream
+	// (2026-08 review).
+	const tmpCleanupAge = 24 * time.Hour
 	go func() {
 		for range time.Tick(time.Minute) {
-			if err := s.RemoveStaleTemps(time.Minute); err != nil {
+			if err := s.RemoveStaleTemps(tmpCleanupAge); err != nil {
 				log.Printf("temp cleanup: %v", err)
 			}
 		}
